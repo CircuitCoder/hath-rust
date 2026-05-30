@@ -77,6 +77,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
+    /// Binding host
+    #[arg(long, default_value = "0.0.0.0")]
+    host: std::net::IpAddr,
+
     /// Cache data location
     #[arg(long, default_value_t = String::from("cache"))]
     cache_dir: String,
@@ -262,6 +266,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Starting HTTP server...");
     let port = args.port.unwrap_or_else(|| init_settings.client_port());
+    let host = args.host;
     let cert = client.get_cert().await.expect("Failed to get server certificate");
     let state = AppState {
         reqwest: create_http_client(Duration::from_secs(30), proxy.clone()),
@@ -274,7 +279,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let flood_control = !(args.disable_flood_control || args.disable_ip_origin_check);
     let server = Server::new(
-        ServerOptions::new(port, cert, state)
+        ServerOptions::new(port, host, cert, state)
             .flood_control(flood_control)
             .metrics(args.enable_metrics)
             .sni_strict(args.sni_strict)
