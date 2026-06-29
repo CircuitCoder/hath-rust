@@ -19,7 +19,7 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http_range_header::parse_range_header;
 use log::error;
@@ -35,6 +35,7 @@ use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
+    ratelimit::{ReqInfo, SERVE_TIMEOUT},
     route::{forbidden, not_found, parse_additional},
     server::util::TruncateBody,
     util::{create_http_client, string_to_hash},
@@ -49,6 +50,7 @@ pub(super) async fn hath(
     headers: HeaderMap,
     data: State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let recv_time = Instant::now();
     let additional = parse_additional(&additional);
     let mut keystamp = additional.get("keystamp").unwrap_or(&"").split('-');
     let file_index = additional.get("fileindex").unwrap_or(&"");
@@ -113,226 +115,267 @@ pub(super) async fn hath(
         .header(CONTENT_TYPE, content_type)
         .header(ETAG, etag);
 
-    // Check cache hit
-    let file_stream = match data.cache_manager.get_file(&info, range.as_ref().map(|r| *r.start())).await {
-        CacheFileResult::Full(stream) => {
-            if range.as_ref().is_some_and(|r| *r.start() != 0) {
-                // File seek fail, reject range request
-                range.take();
+    // Enqueue into the serve scheduler: requests are rate limited and ordered by
+    // response size. The ticket keeps the request in the queue until it is served
+    // or dropped (timeout / early error). The timeout is measured from receipt.
+    let (ticket, grant_rx) = data.scheduler.enqueue(ReqInfo { size: info.size() });
+    let ticket_ref = &ticket;
+    let remaining = SERVE_TIMEOUT.saturating_sub(recv_time.elapsed());
+
+    let served = timeout(remaining, async move {
+        // Check cache hit
+        let file_stream = match data.cache_manager.get_file(&info, range.as_ref().map(|r| *r.start())).await {
+            CacheFileResult::Full(stream) => {
+                if range.as_ref().is_some_and(|r| *r.start() != 0) {
+                    // File seek fail, reject range request
+                    range.take();
+                }
+                Some(stream)
             }
-            Some(stream)
-        }
-        CacheFileResult::Partial(stream) => Some(stream),
-        CacheFileResult::NotFound => None,
-    };
+            CacheFileResult::Partial(stream) => Some(stream),
+            CacheFileResult::NotFound => None,
+        };
 
-    if let Some(stream) = file_stream {
-        return if let Some(r) = range {
-            let content_length = r.end() - r.start() + 1;
-            let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
-            response
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, content_length)
-                .header(CONTENT_RANGE, content_range)
-                .status(StatusCode::PARTIAL_CONTENT)
-                .body(Body::new(TruncateBody::new(Body::from_stream(stream), content_length)))
-                .unwrap()
+        if let Some(stream) = file_stream {
+            // Cache hit: data is available immediately.
+            ticket_ref.set_ready();
+            let Ok(permit) = grant_rx.await else { return not_found() };
+            let response = if let Some(r) = range {
+                let content_length = r.end() - r.start() + 1;
+                let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
+                response
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(CONTENT_LENGTH, content_length)
+                    .header(CONTENT_RANGE, content_range)
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(Body::new(TruncateBody::new(Body::from_stream(stream), content_length)))
+                    .unwrap()
+            } else {
+                response
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(CONTENT_LENGTH, file_size)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            };
+            return response.map(|b| permit.guard(b));
+        }
+
+        // Cache miss, proxy request
+        // Check if the file is already downloading
+        let (temp_tx, temp_rx) = watch::channel(None); // Tempfile
+        let tx = Arc::new(watch::channel(0).0); // Download progress
+        let state;
+        {
+            let mut download_state = data.download_state.lock();
+            state = download_state.get(&info.hash()).cloned();
+            // Tracking download progress
+            if state.is_none() {
+                download_state.insert(info.hash(), (temp_rx.clone(), tx.clone()));
+            }
+        }
+
+        let (temp_path, mut rx) = if let Some((mut tempfile, progress)) = state {
+            let tempfile = tempfile.wait_for(Option::is_some).await;
+            if let Err(err) = tempfile {
+                error!("Waiting tempfile create error: {}", err);
+                data.download_state.lock().remove(&info.hash());
+                return not_found();
+            }
+            (tempfile.unwrap().as_ref().unwrap().clone(), progress.subscribe())
         } else {
-            response
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, file_size)
-                .body(Body::from_stream(stream))
-                .unwrap()
-        };
-    }
+            // Make sure the state will be removed when cancellation.
+            let data2 = data.clone();
+            let state_guard = scopeguard::guard(info.hash(), move |hash| {
+                data2.download_state.lock().remove(&hash);
+            });
 
-    // Cache miss, proxy request
-    // Check if the file is already downloading
-    let (temp_tx, temp_rx) = watch::channel(None); // Tempfile
-    let tx = Arc::new(watch::channel(0).0); // Download progress
-    let state;
-    {
-        let mut download_state = data.download_state.lock();
-        state = download_state.get(&info.hash()).cloned();
-        // Tracking download progress
-        if state.is_none() {
-            download_state.insert(info.hash(), (temp_rx.clone(), tx.clone()));
-        }
-    }
+            let temp_path = Arc::new(data.cache_manager.create_temp_file().await);
+            temp_tx.send_replace(Some(temp_path.clone()));
 
-    let (temp_path, mut rx) = if let Some((mut tempfile, progress)) = state {
-        let tempfile = tempfile.wait_for(Option::is_some).await;
-        if let Err(err) = tempfile {
-            error!("Waiting tempfile create error: {}", err);
-            data.download_state.lock().remove(&info.hash());
-            return not_found();
-        }
-        (tempfile.unwrap().as_ref().unwrap().clone(), progress.subscribe())
-    } else {
-        // Make sure the state will be removed when cancellation.
-        let data2 = data.clone();
-        let state_guard = scopeguard::guard(info.hash(), move |hash| {
-            data2.download_state.lock().remove(&hash);
-        });
+            let metrics = data.metrics.clone();
+            let fetch_time = Instant::now();
+            let sources = match data.rpc.sr_fetch(file_index, xres, &file_id).await {
+                Some(v) => v,
+                None => return not_found(),
+            };
+            metrics
+                .cache_received_duration
+                .get_or_create(&LABEL_CACHE_FETCH_URL)
+                .observe(fetch_time.elapsed().as_secs_f64());
 
-        let temp_path = Arc::new(data.cache_manager.create_temp_file().await);
-        temp_tx.send_replace(Some(temp_path.clone()));
-
-        let metrics = data.metrics.clone();
-        let fetch_time = Instant::now();
-        let sources = match data.rpc.sr_fetch(file_index, xres, &file_id).await {
-            Some(v) => v,
-            None => return not_found(),
-        };
-        metrics
-            .cache_received_duration
-            .get_or_create(&LABEL_CACHE_FETCH_URL)
-            .observe(fetch_time.elapsed().as_secs_f64());
-
-        // Download worker
-        let tx2: Arc<watch::Sender<u64>> = tx.clone();
-        let info2 = info.clone();
-        let temp_path2 = temp_path.clone();
-        tokio::spawn(async move {
-            let download_time = Instant::now();
-            let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
-            let mut progress = 0;
-            let mut reqwest = data.reqwest.clone();
-            let mut sources = sources.iter().cycle();
-            let mut use_proxy = data.has_proxy;
-            'retry: for retry in 0..3 {
-                let mut file = match OpenOptions::new().write(true).create(true).truncate(false).open(&*temp_path2).await {
-                    Ok(mut f) => {
-                        if let Err(err) = f.seek(SeekFrom::Start(progress)).await {
-                            error!("Cache tempfile seek fail: {}", err);
+            // Download worker
+            let tx2: Arc<watch::Sender<u64>> = tx.clone();
+            let info2 = info.clone();
+            let temp_path2 = temp_path.clone();
+            tokio::spawn(async move {
+                let download_time = Instant::now();
+                let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
+                let mut progress = 0;
+                let mut reqwest = data.reqwest.clone();
+                let mut sources = sources.iter().cycle();
+                let mut use_proxy = data.has_proxy;
+                'retry: for retry in 0..3 {
+                    let mut file = match OpenOptions::new().write(true).create(true).truncate(false).open(&*temp_path2).await {
+                        Ok(mut f) => {
+                            if let Err(err) = f.seek(SeekFrom::Start(progress)).await {
+                                error!("Cache tempfile seek fail: {}", err);
+                                continue;
+                            }
+                            f
+                        }
+                        Err(err) => {
+                            error!("Cache tempfile create fail: {}", err);
                             continue;
-                        }
-                        f
-                    }
-                    Err(err) => {
-                        error!("Cache tempfile create fail: {}", err);
-                        continue;
-                    }
-                };
-
-                // Send request
-                let source = sources.next().unwrap();
-                let request = reqwest.get(source).send().await;
-                let mut stream = match request.and_then(|r| r.error_for_status()) {
-                    Ok(r) => r.bytes_stream(),
-                    Err(mut err) => {
-                        err = err_with_url(err, source);
-                        error!("Cache download request fail: {err:?}");
-
-                        // Disable proxy on connect error and third retry
-                        if use_proxy && (err.is_connect() || retry == 1) {
-                            reqwest = create_http_client(Duration::from_secs(30), None, data.local_addr.clone());
-                            use_proxy = false;
-                        }
-
-                        continue;
-                    }
-                };
-
-                // Start download
-                let mut download = 0;
-                while let Some(bytes) = stream.next().await {
-                    let bytes = match bytes {
-                        Ok(it) => it,
-                        Err(mut err) => {
-                            err = err_with_url(err, source);
-                            error!("Cache download fail: {err:?}");
-                            continue 'retry;
                         }
                     };
-                    download += bytes.len() as u64;
 
-                    // Skip downloaded data
-                    if download <= progress {
-                        continue;
-                    }
-                    let write_size = (download - progress) as usize;
-                    let start = bytes.len() - write_size;
-                    let data = &bytes[start..];
-                    if let Err(err) = file.write_all(data).await {
-                        error!("Cache tempfile write fail: {}", err);
-                        break 'retry;
-                    }
-                    hasher.update(data);
-                    progress += write_size as u64;
-                    metrics.cache_received_size.inc_by(write_size as u64);
-                    tx2.send_replace(progress);
-                }
-                if progress == file_size {
-                    if let Err(err) = file.flush().await {
-                        error!("Cache tempfile flush fail: {}", err);
-                        break 'retry;
-                    }
-                    let hash = hasher.finish();
-                    let duration = download_time.elapsed();
-                    tx2.send_replace(progress);
-                    let _ = file.sync_all().await; // fsync
-                    drop(file); // Close file
-                    tx2.closed().await; // Wait all request done
-                    data.download_state.lock().remove(&info2.hash());
-                    if hash.as_ref() == info2.hash() {
-                        tx2.closed().await; // Wait again to avoid race conditions
-                        data.cache_manager.import_cache(&info2, &temp_path2).await;
-                        metrics.cache_received.inc();
-                        metrics
-                            .cache_received_duration
-                            .get_or_create(&LABEL_CACHE_DOWNLOAD)
-                            .observe(duration.as_secs_f64());
-                    } else {
-                        error!("Cache tempfile hash mismatch: expected: {:x?}, got: {:x?}", info2.hash(), hash);
-                    }
-                    return;
-                }
-            }
+                    // Send request
+                    let source = sources.next().unwrap();
+                    let request = reqwest.get(source).send().await;
+                    let mut stream = match request.and_then(|r| r.error_for_status()) {
+                        Ok(r) => r.bytes_stream(),
+                        Err(mut err) => {
+                            err = err_with_url(err, source);
+                            error!("Cache download request fail: {err:?}");
 
-            // Try remove from download state anyway
-            drop(state_guard);
-        });
+                            // Disable proxy on connect error and third retry
+                            if use_proxy && (err.is_connect() || retry == 1) {
+                                reqwest = create_http_client(Duration::from_secs(30), None, data.local_addr.clone());
+                                use_proxy = false;
+                            }
 
-        (temp_path, tx.subscribe())
-    };
-
-    // Wait download start or 404
-    if *rx.borrow() == 0 && rx.changed().await.is_err() {
-        return not_found();
-    }
-
-    response
-        .header(CONTENT_LENGTH, file_size)
-        .body(Body::from_stream(stream! {
-            let mut file = File::open(temp_path.as_ref()).await.unwrap();
-            let mut read_off = 0;
-            let mut write_off = *rx.borrow();
-
-            let wait_time = Duration::from_secs(30);
-            'watch: while write_off > read_off || timeout(wait_time, rx.changed()).await.is_ok_and(|r| r.is_ok()) {
-                write_off = *rx.borrow();
-
-                let mut buffer = BytesMut::with_capacity(64*1024); // 64 KiB
-                while write_off > read_off {
-                    buffer.reserve(64*1024);
-                    match file.read_buf(&mut buffer).await {
-                        Ok(0) => {
-                            // Data may not synced to disk, retry later
-                            sleep(Duration::from_millis(10)).await;
                             continue;
                         }
-                        Ok(s) => read_off += s as u64,
-                        Err(err) => yield Err(err)
-                    }
-                    yield Ok(buffer.split().freeze());
+                    };
 
-                    // EOF
-                    if read_off == file_size {
-                        break 'watch;
+                    // Start download
+                    let mut download = 0;
+                    while let Some(bytes) = stream.next().await {
+                        let bytes = match bytes {
+                            Ok(it) => it,
+                            Err(mut err) => {
+                                err = err_with_url(err, source);
+                                error!("Cache download fail: {err:?}");
+                                continue 'retry;
+                            }
+                        };
+                        download += bytes.len() as u64;
+
+                        // Skip downloaded data
+                        if download <= progress {
+                            continue;
+                        }
+                        let write_size = (download - progress) as usize;
+                        let start = bytes.len() - write_size;
+                        let data = &bytes[start..];
+                        if let Err(err) = file.write_all(data).await {
+                            error!("Cache tempfile write fail: {}", err);
+                            break 'retry;
+                        }
+                        hasher.update(data);
+                        progress += write_size as u64;
+                        metrics.cache_received_size.inc_by(write_size as u64);
+                        tx2.send_replace(progress);
+                    }
+                    if progress == file_size {
+                        if let Err(err) = file.flush().await {
+                            error!("Cache tempfile flush fail: {}", err);
+                            break 'retry;
+                        }
+                        let hash = hasher.finish();
+                        let duration = download_time.elapsed();
+                        tx2.send_replace(progress);
+                        let _ = file.sync_all().await; // fsync
+                        drop(file); // Close file
+                        tx2.closed().await; // Wait all request done
+                        data.download_state.lock().remove(&info2.hash());
+                        if hash.as_ref() == info2.hash() {
+                            tx2.closed().await; // Wait again to avoid race conditions
+                            data.cache_manager.import_cache(&info2, &temp_path2).await;
+                            metrics.cache_received.inc();
+                            metrics
+                                .cache_received_duration
+                                .get_or_create(&LABEL_CACHE_DOWNLOAD)
+                                .observe(duration.as_secs_f64());
+                        } else {
+                            error!("Cache tempfile hash mismatch: expected: {:x?}, got: {:x?}", info2.hash(), hash);
+                        }
+                        return;
                     }
                 }
-            }
+
+                // Try remove from download state anyway
+                drop(state_guard);
+            });
+
+            (temp_path, tx.subscribe())
+        };
+
+        // Wait download start or 404
+        if *rx.borrow() == 0 && rx.changed().await.is_err() {
+            return not_found();
+        }
+
+        // Refill has started: data is now available to stream.
+        ticket_ref.set_ready();
+        let Ok(permit) = grant_rx.await else { return not_found() };
+
+        let response = response
+            .header(CONTENT_LENGTH, file_size)
+            .body(Body::from_stream(stream! {
+                let mut file = File::open(temp_path.as_ref()).await.unwrap();
+                let mut read_off = 0;
+                let mut write_off = *rx.borrow();
+
+                let wait_time = Duration::from_secs(30);
+                'watch: while write_off > read_off || timeout(wait_time, rx.changed()).await.is_ok_and(|r| r.is_ok()) {
+                    write_off = *rx.borrow();
+
+                    let mut buffer = BytesMut::with_capacity(64*1024); // 64 KiB
+                    while write_off > read_off {
+                        buffer.reserve(64*1024);
+                        match file.read_buf(&mut buffer).await {
+                            Ok(0) => {
+                                // Data may not synced to disk, retry later
+                                sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Ok(s) => read_off += s as u64,
+                            Err(err) => yield Err(err)
+                        }
+                        yield Ok(buffer.split().freeze());
+
+                        // EOF
+                        if read_off == file_size {
+                            break 'watch;
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+        response.map(|b| permit.guard(b))
+    })
+    .await;
+
+    match served {
+        Ok(response) => response,
+        Err(_) => {
+            // Timed out waiting in the serve pool: remove from the queue (via the
+            // ticket's Drop) and reset the connection.
+            drop(ticket);
+            reset_connection()
+        }
+    }
+}
+
+/// Build a response that resets the connection instead of sending a complete
+/// reply. Used when a request times out in the serve pool: the body errors
+/// immediately so hyper tears the connection down rather than finishing normally.
+fn reset_connection() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(Body::from_stream(stream! {
+            yield Err::<Bytes, _>(std::io::Error::other("serve timeout"));
         }))
         .unwrap()
 }

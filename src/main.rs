@@ -44,6 +44,7 @@ mod gallery_downloader;
 mod logger;
 mod metrics;
 mod middleware;
+mod ratelimit;
 mod route;
 mod rpc;
 mod server;
@@ -165,6 +166,7 @@ pub struct AppState {
     has_proxy: bool,
     metrics: Arc<Metrics>,
     local_addr: Option<IpAddr>,
+    scheduler: Arc<ratelimit::SchedulerHandle>,
 }
 
 pub enum Command {
@@ -278,6 +280,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         has_proxy: proxy.is_some(),
         metrics: metrics.clone(),
         local_addr: args.host.clone(),
+        scheduler: ratelimit::SchedulerHandle::spawn(),
     };
     let flood_control = !(args.disable_flood_control || args.disable_ip_origin_check);
     let server = Server::new(
