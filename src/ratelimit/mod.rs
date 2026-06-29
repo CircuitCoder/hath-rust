@@ -41,8 +41,10 @@ use tokio::{
     time::Instant,
 };
 
+mod concurrency;
 mod gcra;
 
+use concurrency::ConcurrencyLimiter;
 use gcra::GcraLimiter;
 
 // --- Placeholder configuration -------------------------------------------------
@@ -60,6 +62,9 @@ const REQUEST_BURST: u32 = 200;
 /// 125 MB/s == 1 Gbps; counted in bytes.
 const TRAFFIC_RATE: f64 = 125_000_000.0;
 const TRAFFIC_BURST: u32 = 250_000_000;
+
+/// Hard cap on the number of requests being served concurrently.
+const CONCURRENCY_LIMIT: usize = 200;
 
 // --- Public request description ------------------------------------------------
 
@@ -91,6 +96,8 @@ struct RateLimiters {
     req_rate_limit: GcraLimiter,
     /// Limits bandwidth; each request costs its response size in bytes.
     traffic_rate_limit: GcraLimiter,
+    /// Hard cap on concurrently-serving requests.
+    concurrency: ConcurrencyLimiter,
 }
 
 impl RateLimiters {
@@ -98,6 +105,7 @@ impl RateLimiters {
         Self {
             req_rate_limit: GcraLimiter::new(REQUEST_RATE, REQUEST_BURST, |_| 1),
             traffic_rate_limit: GcraLimiter::new(TRAFFIC_RATE, TRAFFIC_BURST, |info| info.size),
+            concurrency: ConcurrencyLimiter::new(CONCURRENCY_LIMIT),
         }
     }
 
@@ -106,8 +114,12 @@ impl RateLimiters {
     /// blocking limiter might allow progress (re-checking then converges).
     fn check(&self, now: Instant, info: &ReqInfo) -> Decision {
         let mut wakeups = Vec::new();
-        for limiter in [&self.req_rate_limit, &self.traffic_rate_limit] {
-            if let Decision::Blocked(wakeup) = limiter.check(now, info) {
+        for decision in [
+            self.req_rate_limit.check(now, info),
+            self.traffic_rate_limit.check(now, info),
+            self.concurrency.check(now, info),
+        ] {
+            if let Decision::Blocked(wakeup) = decision {
                 wakeups.push(wakeup);
             }
         }
@@ -124,12 +136,14 @@ impl RateLimiters {
     fn on_start(&mut self, now: Instant, info: &ReqInfo) {
         self.req_rate_limit.on_start(now, info);
         self.traffic_rate_limit.on_start(now, info);
+        self.concurrency.on_start(now, info);
     }
 
     /// Release a finished serve on every limiter.
     fn on_end(&mut self, info: &ReqInfo) {
         self.req_rate_limit.on_end(info);
         self.traffic_rate_limit.on_end(info);
+        self.concurrency.on_end(info);
     }
 }
 
@@ -287,11 +301,17 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
             match limiters.check(now, &info) {
                 Decision::Ready => {
                     let waiter = queue.remove(&key).expect("key just observed");
-                    let permit = Permit { tx: tx.clone(), info };
-                    // Only consume capacity if the handler is still waiting.
-                    if waiter.grant.send(permit).is_ok() {
-                        limiters.on_start(now, &info);
+                    // Skip handlers that already gave up so we don't consume capacity
+                    // for a serve that will never happen.
+                    if waiter.grant.is_closed() {
+                        continue;
                     }
+                    // Commit before building the permit so that on_start and the
+                    // permit's eventual End (on_end) are paired exactly 1:1 — even
+                    // if `send` races a handler drop, the returned permit's End
+                    // releases the capacity we just took.
+                    limiters.on_start(now, &info);
+                    let _ = waiter.grant.send(Permit { tx: tx.clone(), info });
                 }
                 Decision::Blocked(wakeup) => break Some(wakeup),
             }
