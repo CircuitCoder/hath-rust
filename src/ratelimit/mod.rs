@@ -44,13 +44,13 @@ use tokio::{
     time::Instant,
 };
 
-use crate::Command;
+use crate::{Command, metrics::Metrics};
 
 mod concurrency;
 mod gcra;
 
-use concurrency::ConcurrencyLimiter;
-use gcra::GcraLimiter;
+use concurrency::{ConcurrencyLimiter, ConcurrencyObserver};
+use gcra::{GcraLimiter, GcraObserver};
 
 // --- Tunable configuration -----------------------------------------------------
 
@@ -157,6 +157,22 @@ impl RateLimiters {
         self.traffic_rate_limit.on_end(info);
         self.concurrency.on_end(info);
     }
+
+    /// Lock-free read handles for the metrics endpoint.
+    fn observers(&self) -> LimiterObservers {
+        LimiterObservers {
+            req_rate: self.req_rate_limit.observer(),
+            traffic_rate: self.traffic_rate_limit.observer(),
+            concurrency: self.concurrency.observer(),
+        }
+    }
+}
+
+/// Lock-free read handles into the rate limiters, used by the metrics collector.
+struct LimiterObservers {
+    req_rate: GcraObserver,
+    traffic_rate: GcraObserver,
+    concurrency: ConcurrencyObserver,
 }
 
 // --- Scheduler messages & state ------------------------------------------------
@@ -203,11 +219,21 @@ pub struct SchedulerHandle {
 impl SchedulerHandle {
     /// Spawn the scheduler task and return a shared handle to it. The `command`
     /// channel is used to notify the RPC server when the queue sheds too many
-    /// requests (overload).
-    pub fn spawn(config: SchedulerConfig, command: Sender<Command>) -> Arc<Self> {
+    /// requests (overload). Registers a lock-free metrics collector exposing the
+    /// limiter bucket levels and the live queue size.
+    pub fn spawn(config: SchedulerConfig, command: Sender<Command>, refill: Arc<RefillLimiter>, metrics: &mut Metrics) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = Arc::new(Self { tx: tx.clone(), seq: AtomicU64::new(0) });
-        tokio::spawn(run(rx, tx, config, command));
+        let limiters = RateLimiters::new(&config);
+        let overload = OverloadTracker::new(config.overload_rate, config.overload_notify_interval, command);
+        let queue_size = Arc::new(AtomicU64::new(0));
+        metrics.register_scheduler(SchedulerCollector {
+            limiters: limiters.observers(),
+            overload: overload.gcra.observer(),
+            queue_size: queue_size.clone(),
+            refill,
+        });
+        tokio::spawn(run(rx, tx, config, limiters, overload, queue_size));
         handle
     }
 
@@ -289,6 +315,11 @@ impl RefillLimiter {
             .ok()
             .map(|_| RefillPermit { limiter: self.clone() })
     }
+
+    /// Remaining free refill slots, read lock-free for metrics.
+    pub fn available(&self) -> u64 {
+        self.limit.saturating_sub(self.count.load(Ordering::Relaxed))
+    }
 }
 
 /// Holds a refill slot for the lifetime of a download worker; releases on drop.
@@ -333,10 +364,15 @@ impl HttpBody for GuardBody {
 
 // --- Scheduler task ------------------------------------------------------------
 
-async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<SchedMsg>, config: SchedulerConfig, command: Sender<Command>) {
+async fn run(
+    mut rx: mpsc::UnboundedReceiver<SchedMsg>,
+    tx: UnboundedSender<SchedMsg>,
+    config: SchedulerConfig,
+    mut limiters: RateLimiters,
+    mut overload: OverloadTracker,
+    queue_size: Arc<AtomicU64>,
+) {
     let mut queue: BTreeMap<Key, Waiter> = BTreeMap::new();
-    let mut limiters = RateLimiters::new(&config);
-    let mut overload = OverloadTracker::new(config.overload_rate, config.overload_notify_interval, command);
 
     loop {
         // Dispatch as many requests as the limiters currently allow. Every queued
@@ -366,6 +402,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
                 Decision::Blocked(wakeup) => break Some(wakeup),
             }
         };
+        queue_size.store(queue.len() as u64, Ordering::Relaxed);
 
         // Wait for a queue change or for a blocked limiter to free up.
         match wakeup {
@@ -373,14 +410,14 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
                 tokio::select! {
                     biased;
                     msg = rx.recv() => match msg {
-                        Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload),
+                        Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload, &queue_size),
                         None => break,
                     },
                     _ = wakeup => {}
                 }
             }
             None => match rx.recv().await {
-                Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload),
+                Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload, &queue_size),
                 None => break,
             },
         }
@@ -393,6 +430,7 @@ fn apply(
     limiters: &mut RateLimiters,
     config: &SchedulerConfig,
     overload: &mut OverloadTracker,
+    queue_size: &AtomicU64,
 ) {
     match msg {
         SchedMsg::Enqueue { seq, info, grant } => {
@@ -411,6 +449,7 @@ fn apply(
         }
         SchedMsg::End { info } => limiters.on_end(&info),
     }
+    queue_size.store(queue.len() as u64, Ordering::Relaxed);
 }
 
 /// Tracks rejected (evicted) requests with a GCRA bucket sized to one minute of
@@ -447,5 +486,43 @@ impl OverloadTracker {
                 }
             }
         }
+    }
+}
+
+/// Prometheus collector exposing the live state of the serve scheduler's rate
+/// limiters and queue. All values are read lock-free from shared handles: the
+/// GCRA bucket levels are computed online against the current clock, so nothing
+/// extra is kept inside `Metrics`. Intended to be scraped infrequently.
+pub struct SchedulerCollector {
+    limiters: LimiterObservers,
+    overload: GcraObserver,
+    queue_size: Arc<AtomicU64>,
+    refill: Arc<RefillLimiter>,
+}
+
+impl std::fmt::Debug for SchedulerCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SchedulerCollector")
+    }
+}
+
+impl prometheus_client::collector::Collector for SchedulerCollector {
+    fn encode(&self, mut encoder: prometheus_client::encoding::DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        use prometheus_client::{encoding::EncodeMetric, metrics::gauge::ConstGauge};
+
+        let now = Instant::now();
+        for (name, help, value) in [
+            ("concurrency_available", "Remaining concurrent serve slots", self.limiters.concurrency.available()),
+            ("request_rate_remaining", "Remaining requests in the request-rate bucket", self.limiters.req_rate.remaining(now)),
+            ("traffic_rate_remaining", "Remaining bytes in the traffic-rate bucket", self.limiters.traffic_rate.remaining(now)),
+            ("overload_remaining", "Remaining rejections in the overload bucket", self.overload.remaining(now)),
+            ("queue_size", "Number of requests waiting in the serve queue", self.queue_size.load(Ordering::Relaxed)),
+            ("refill_available", "Remaining concurrent cache-miss refill slots", self.refill.available()),
+        ] {
+            let gauge = ConstGauge::new(value as i64);
+            let metric_encoder = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;
+            gauge.encode(metric_encoder)?;
+        }
+        Ok(())
     }
 }

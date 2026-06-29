@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .flush(args.flush_log)
         .console_level(args.quiet);
 
-    let metrics = Arc::new(Metrics::new());
+    let mut metrics = Metrics::new();
 
     info!("Hentai@Home {COMPAT_VERSION} (Rust {VERSION}) starting up");
 
@@ -280,6 +280,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (shutdown_send, shutdown_recv) = mpsc::unbounded_channel::<()>();
     let settings = client.settings();
     logger.config().write_info(!settings.disable_logging());
+    // Command channel
+    let (tx, mut rx) = mpsc::channel::<Command>(1);
+    let refill_limiter = ratelimit::RefillLimiter::new(args.refill_limit);
+    let scheduler = ratelimit::SchedulerHandle::spawn(
+        ratelimit::SchedulerConfig {
+            queue_limit: args.serve_queue_limit,
+            request_rate: args.request_rate,
+            request_burst: args.request_burst,
+            traffic_rate: args.traffic_rate,
+            traffic_burst: args.traffic_burst,
+            concurrency_limit: args.concurrency_limit,
+            overload_rate: args.overload_rate,
+            overload_notify_interval: Duration::from_secs(args.overload_notify_interval),
+        },
+        tx.clone(),
+        refill_limiter.clone(),
+        &mut metrics,
+    );
+    let metrics = Arc::new(metrics);
     let cache_manager = CacheManager::new(
         CacheConfig::new(args.data_dir, args.cache_dir, args.temp_dir),
         settings.clone(),
@@ -302,8 +321,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
-    // Command channel
-    let (tx, mut rx) = mpsc::channel::<Command>(1);
 
     info!("Starting HTTP server...");
     let port = args.port.unwrap_or_else(|| init_settings.client_port());
@@ -318,20 +335,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         has_proxy: proxy.is_some(),
         metrics: metrics.clone(),
         local_addr: args.host.clone(),
-        scheduler: ratelimit::SchedulerHandle::spawn(
-            ratelimit::SchedulerConfig {
-                queue_limit: args.serve_queue_limit,
-                request_rate: args.request_rate,
-                request_burst: args.request_burst,
-                traffic_rate: args.traffic_rate,
-                traffic_burst: args.traffic_burst,
-                concurrency_limit: args.concurrency_limit,
-                overload_rate: args.overload_rate,
-                overload_notify_interval: Duration::from_secs(args.overload_notify_interval),
-            },
-            tx.clone(),
-        ),
-        refill_limiter: ratelimit::RefillLimiter::new(args.refill_limit),
+        scheduler,
+        refill_limiter,
         serve_timeout: Duration::from_secs(args.serve_timeout),
     };
     let flood_control = !(args.disable_flood_control || args.disable_ip_origin_check);

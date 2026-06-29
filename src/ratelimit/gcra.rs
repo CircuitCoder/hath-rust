@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::time::{Instant, sleep};
 
@@ -15,6 +21,11 @@ use super::{Decision, ReqInfo};
 /// consumed on serve start ([`on_start`]); there is nothing to release on serve
 /// end, so it wakes purely on the clock.
 ///
+/// `tat` is kept in an [`Arc<AtomicI64>`] (nanoseconds relative to `base`) so the
+/// metrics endpoint can read the live bucket level lock-free and compute the
+/// remaining capacity online — see [`GcraObserver`]. The limiter itself remains
+/// single-owner; the atomic is only ever written from the scheduler task.
+///
 /// [`cost`]: GcraLimiter::cost
 /// [`on_start`]: GcraLimiter::on_start
 pub struct GcraLimiter {
@@ -24,8 +35,10 @@ pub struct GcraLimiter {
     tolerance: Duration,
     /// Resource consumed by a request (e.g. `1` for req-rate, size for bandwidth).
     cost: fn(&ReqInfo) -> u32,
-    /// Theoretical arrival time.
-    tat: Instant,
+    /// Origin for the nanosecond offsets stored in `tat`.
+    base: Instant,
+    /// Theoretical arrival time, as nanoseconds since `base`.
+    tat: Arc<AtomicI64>,
 }
 
 impl GcraLimiter {
@@ -39,7 +52,8 @@ impl GcraLimiter {
             per_unit,
             tolerance,
             cost,
-            tat: Instant::now(),
+            base: Instant::now(),
+            tat: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -48,12 +62,17 @@ impl GcraLimiter {
         self.per_unit.saturating_mul((self.cost)(info))
     }
 
+    /// The theoretical arrival time as an absolute [`Instant`].
+    fn tat(&self) -> Instant {
+        self.base + Duration::from_nanos(self.tat.load(Ordering::Relaxed).max(0) as u64)
+    }
+
     /// Read-only check: is a request allowed to start right now?
     ///
     /// Allowed when `tat + increment <= now + tolerance`. Otherwise the wakeup
     /// sleeps exactly until that becomes true.
     pub fn check(&self, now: Instant, info: &ReqInfo) -> Decision {
-        let target = self.tat + self.increment(info);
+        let target = self.tat() + self.increment(info);
         let threshold = now + self.tolerance;
         if target <= threshold {
             Decision::Ready
@@ -64,9 +83,40 @@ impl GcraLimiter {
 
     /// Commit a grant: advance the theoretical arrival time by the request's cost.
     pub fn on_start(&mut self, now: Instant, info: &ReqInfo) {
-        self.tat = self.tat.max(now) + self.increment(info);
+        let tat = self.tat().max(now) + self.increment(info);
+        self.tat.store(tat.saturating_duration_since(self.base).as_nanos() as i64, Ordering::Relaxed);
     }
 
     /// GCRA has no per-serve state to release.
     pub fn on_end(&mut self, _info: &ReqInfo) {}
+
+    /// A lock-free handle for reading the bucket's remaining capacity.
+    pub fn observer(&self) -> GcraObserver {
+        GcraObserver {
+            per_unit: self.per_unit,
+            tolerance: self.tolerance,
+            base: self.base,
+            tat: self.tat.clone(),
+        }
+    }
+}
+
+/// Lock-free view of a [`GcraLimiter`]'s remaining bucket capacity, computed
+/// online against the current clock. Reports units (requests for req-rate,
+/// bytes for traffic), so a full bucket equals the configured burst.
+pub struct GcraObserver {
+    per_unit: Duration,
+    tolerance: Duration,
+    base: Instant,
+    tat: Arc<AtomicI64>,
+}
+
+impl GcraObserver {
+    /// Remaining units in the bucket at `now`, capped at the burst capacity.
+    pub fn remaining(&self, now: Instant) -> u64 {
+        let tat = self.base + Duration::from_nanos(self.tat.load(Ordering::Relaxed).max(0) as u64);
+        let used = tat.saturating_duration_since(now);
+        let free = self.tolerance.saturating_sub(used);
+        (free.as_secs_f64() / self.per_unit.as_secs_f64()) as u64
+    }
 }

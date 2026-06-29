@@ -39,6 +39,7 @@ pub struct Metrics {
     pub download_file_count: Counter,
     pub download_size: Counter,
     pub download_duration: Histogram,
+    pub serve_timeout: Counter,
 }
 
 impl Metrics {
@@ -88,6 +89,10 @@ impl Metrics {
         // Uptime
         registry.register_collector(Box::new(Uptime::new()));
 
+        // Serve scheduler
+        let serve_timeout = Counter::default();
+        registry.register("serve_timeout", "Number of requests that hit the serve timeout", serve_timeout.clone());
+
         Self {
             registry,
             cache_sent,
@@ -105,7 +110,14 @@ impl Metrics {
             download_file_count,
             download_size,
             download_duration,
+            serve_timeout,
         }
+    }
+
+    /// Register the serve-scheduler collector. Called once the scheduler is
+    /// spawned, since the collector borrows lock-free handles into its limiters.
+    pub fn register_scheduler(&mut self, collector: crate::ratelimit::SchedulerCollector) {
+        self.registry.register_collector(Box::new(collector));
     }
 }
 

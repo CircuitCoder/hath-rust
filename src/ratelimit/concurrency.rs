@@ -1,4 +1,4 @@
-use std::future::pending;
+use std::{future::pending, sync::Arc};
 
 use tokio::{sync::Semaphore, time::Instant};
 
@@ -15,13 +15,13 @@ use super::{Decision, ReqInfo};
 /// [`on_start`]: ConcurrencyLimiter::on_start
 /// [`on_end`]: ConcurrencyLimiter::on_end
 pub struct ConcurrencyLimiter {
-    sem: Semaphore,
+    sem: Arc<Semaphore>,
 }
 
 impl ConcurrencyLimiter {
     /// Allow at most `limit` requests to be served concurrently.
     pub fn new(limit: usize) -> Self {
-        Self { sem: Semaphore::new(limit) }
+        Self { sem: Arc::new(Semaphore::new(limit)) }
     }
 
     /// Ready while a permit is available. When full, the wakeup never fires on its
@@ -48,5 +48,22 @@ impl ConcurrencyLimiter {
     /// Return a permit when a serve finishes.
     pub fn on_end(&mut self, _info: &ReqInfo) {
         self.sem.add_permits(1);
+    }
+
+    /// A lock-free handle for reading the number of remaining permits.
+    pub fn observer(&self) -> ConcurrencyObserver {
+        ConcurrencyObserver { sem: self.sem.clone() }
+    }
+}
+
+/// Lock-free view of a [`ConcurrencyLimiter`]'s free capacity.
+pub struct ConcurrencyObserver {
+    sem: Arc<Semaphore>,
+}
+
+impl ConcurrencyObserver {
+    /// Number of serves that may currently start before hitting the cap.
+    pub fn available(&self) -> u64 {
+        self.sem.available_permits() as u64
     }
 }

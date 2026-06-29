@@ -124,6 +124,7 @@ pub(super) async fn hath(
     // Clone the scheduler handle here because `data` is moved into the download
     // worker on a cache miss, so it is not available after that point.
     let scheduler = data.scheduler.clone();
+    let timeout_metric = data.metrics.serve_timeout.clone();
     let remaining = data.serve_timeout.saturating_sub(recv_time.elapsed());
 
     let served = timeout(remaining, async move {
@@ -392,6 +393,7 @@ pub(super) async fn hath(
             // enqueued (it reached the ready point), cancelling the serve future
             // drops its Ticket, which removes it from the queue; reset the
             // connection.
+            timeout_metric.inc();
             reset_connection()
         }
     }
