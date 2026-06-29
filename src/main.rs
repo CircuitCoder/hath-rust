@@ -109,9 +109,46 @@ struct Args {
     #[arg(long, default_value_t = false)]
     flush_log: bool,
 
-    /// Override the max connection soft limit, should only be used in special cases
-    #[arg(long, default_value_t = 0)]
-    max_connection: u64,
+    /// Seconds a request may wait in the serve queue before its connection is reset.
+    #[arg(long, default_value_t = 30)]
+    serve_timeout: u64,
+
+    /// Maximum number of requests allowed to wait in the serve queue; the largest
+    /// queued request is evicted when exceeded.
+    #[arg(long, default_value_t = 800)]
+    serve_queue_limit: usize,
+
+    /// Maximum number of concurrent cache-miss refills; further misses are dropped.
+    #[arg(long, default_value_t = 100)]
+    refill_limit: u64,
+
+    /// Sustained request-rate limit (requests/second).
+    #[arg(long, default_value_t = 100.0)]
+    request_rate: f64,
+
+    /// Request-rate limiter burst tolerance (requests).
+    #[arg(long, default_value_t = 200)]
+    request_burst: u32,
+
+    /// Sustained bandwidth limit (bytes/second). Default 125 MB/s == 1 Gbps.
+    #[arg(long, default_value_t = 125_000_000.0)]
+    traffic_rate: f64,
+
+    /// Bandwidth limiter burst tolerance (bytes).
+    #[arg(long, default_value_t = 250_000_000)]
+    traffic_burst: u32,
+
+    /// Hard cap on the number of requests served concurrently.
+    #[arg(long, default_value_t = 200)]
+    concurrency_limit: usize,
+
+    /// Sustained rejected requests/second tolerated before reporting overload.
+    #[arg(long, default_value_t = 100.0)]
+    overload_rate: f64,
+
+    /// Minimum seconds between two overload notifications to the RPC server.
+    #[arg(long, default_value_t = 300)]
+    overload_notify_interval: u64,
 
     /// Disable server command ip check, also disable flood control
     #[arg(long, default_value_t = false)]
@@ -166,6 +203,8 @@ pub struct AppState {
     metrics: Arc<Metrics>,
     local_addr: Option<IpAddr>,
     scheduler: Arc<ratelimit::SchedulerHandle>,
+    refill_limiter: Arc<ratelimit::RefillLimiter>,
+    serve_timeout: Duration,
 }
 
 pub enum Command {
@@ -221,7 +260,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(i) => i,
         None => setup(&args.data_dir).await?,
     };
-    let client = Arc::new(RPCClient::new(id, &key, args.disable_ip_origin_check, args.max_connection, args.rpc_server_ip.as_deref(), args.host.clone()));
+    let client = Arc::new(RPCClient::new(id, &key, args.disable_ip_origin_check, args.rpc_server_ip.as_deref(), args.host.clone()));
     let init_settings = match client.login().await {
         Ok(settings) => settings,
         Err(err) => {
@@ -279,7 +318,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         has_proxy: proxy.is_some(),
         metrics: metrics.clone(),
         local_addr: args.host.clone(),
-        scheduler: ratelimit::SchedulerHandle::spawn(),
+        scheduler: ratelimit::SchedulerHandle::spawn(
+            ratelimit::SchedulerConfig {
+                queue_limit: args.serve_queue_limit,
+                request_rate: args.request_rate,
+                request_burst: args.request_burst,
+                traffic_rate: args.traffic_rate,
+                traffic_burst: args.traffic_burst,
+                concurrency_limit: args.concurrency_limit,
+                overload_rate: args.overload_rate,
+                overload_notify_interval: Duration::from_secs(args.overload_notify_interval),
+            },
+            tx.clone(),
+        ),
+        refill_limiter: ratelimit::RefillLimiter::new(args.refill_limit),
+        serve_timeout: Duration::from_secs(args.serve_timeout),
     };
     let flood_control = !(args.disable_flood_control || args.disable_ip_origin_check);
     let server = Server::new(

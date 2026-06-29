@@ -28,7 +28,7 @@ pub fn register_layer(router: Router<Arc<AppState>>, data: &AppState, server_hea
                 .layer(TimeoutLayer::new(Duration::from_secs(181))),
         )
         .layer(Logger::new(data.metrics.clone()))
-        .layer(ConnectionCounter::new(data.metrics.connections.clone(), data.rpc.settings(), data.command_channel.clone()));
+        .layer(ConnectionCounter::new(data.metrics.connections.clone()));
 
     if server_header {
         router = router.layer(middleware::map_response(default_headers));

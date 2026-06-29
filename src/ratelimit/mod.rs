@@ -34,14 +34,17 @@ use axum::body::Body;
 use bytes::Bytes;
 use futures::future::select_all;
 use http_body::Body as HttpBody;
+use log::warn;
 use pin_project_lite::pin_project;
 use tokio::{
     sync::{
-        mpsc::{self, UnboundedSender},
+        mpsc::{self, Sender, UnboundedSender},
         oneshot,
     },
     time::Instant,
 };
+
+use crate::Command;
 
 mod concurrency;
 mod gcra;
@@ -49,24 +52,29 @@ mod gcra;
 use concurrency::ConcurrencyLimiter;
 use gcra::GcraLimiter;
 
-// --- Placeholder configuration -------------------------------------------------
-// TODO: expose via CLI / settings. These are test values only.
+// --- Tunable configuration -----------------------------------------------------
 
-/// How long a request may wait in the pool (measured from receipt) before it
-/// gives up and the connection is reset.
-pub const SERVE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Request-rate limiter: sustained requests/second and burst (in requests).
-const REQUEST_RATE: f64 = 100.0;
-const REQUEST_BURST: u32 = 200;
-
-/// Bandwidth limiter: sustained bytes/second and burst (in bytes).
-/// 125 MB/s == 1 Gbps; counted in bytes.
-const TRAFFIC_RATE: f64 = 125_000_000.0;
-const TRAFFIC_BURST: u32 = 250_000_000;
-
-/// Hard cap on the number of requests being served concurrently.
-const CONCURRENCY_LIMIT: usize = 200;
+/// Tunable limits for the scheduler and rate limiters, supplied from CLI args.
+#[derive(Clone, Copy)]
+pub struct SchedulerConfig {
+    /// Maximum number of requests allowed to sit in the queue; pushing past it
+    /// evicts the largest (lowest priority) waiter.
+    pub queue_limit: usize,
+    /// Request-rate limiter: sustained requests/second.
+    pub request_rate: f64,
+    /// Request-rate limiter: burst (in requests).
+    pub request_burst: u32,
+    /// Bandwidth limiter: sustained bytes/second.
+    pub traffic_rate: f64,
+    /// Bandwidth limiter: burst (in bytes).
+    pub traffic_burst: u32,
+    /// Hard cap on the number of requests being served concurrently.
+    pub concurrency_limit: usize,
+    /// Sustained rejected-requests-per-second tolerated before signalling overload.
+    pub overload_rate: f64,
+    /// Minimum gap between two overload notifications sent to the RPC server.
+    pub overload_notify_interval: Duration,
+}
 
 // --- Public request description ------------------------------------------------
 
@@ -105,11 +113,11 @@ struct RateLimiters {
 }
 
 impl RateLimiters {
-    fn new() -> Self {
+    fn new(config: &SchedulerConfig) -> Self {
         Self {
-            req_rate_limit: GcraLimiter::new(REQUEST_RATE, REQUEST_BURST, |_| 1),
-            traffic_rate_limit: GcraLimiter::new(TRAFFIC_RATE, TRAFFIC_BURST, |info| info.size),
-            concurrency: ConcurrencyLimiter::new(CONCURRENCY_LIMIT),
+            req_rate_limit: GcraLimiter::new(config.request_rate, config.request_burst, |_| 1),
+            traffic_rate_limit: GcraLimiter::new(config.traffic_rate, config.traffic_burst, |info| info.size),
+            concurrency: ConcurrencyLimiter::new(config.concurrency_limit),
         }
     }
 
@@ -153,11 +161,20 @@ impl RateLimiters {
 
 // --- Scheduler messages & state ------------------------------------------------
 
+/// Result delivered to a waiting handler once the scheduler reaches its request.
+pub enum GrantResult {
+    /// The request may proceed; hold the [`Permit`] for the whole response body.
+    Granted(Permit),
+    /// The request was evicted from the queue (capacity exceeded). The handler
+    /// should behave as if its serve timeout elapsed.
+    Evicted,
+}
+
 enum SchedMsg {
     Enqueue {
         seq: u64,
         info: ReqInfo,
-        grant: oneshot::Sender<Permit>,
+        grant: oneshot::Sender<GrantResult>,
     },
     Remove {
         key: Key,
@@ -169,7 +186,7 @@ enum SchedMsg {
 
 struct Waiter {
     info: ReqInfo,
-    grant: oneshot::Sender<Permit>,
+    grant: oneshot::Sender<GrantResult>,
 }
 
 /// Priority key: smallest response first, then arrival order for stability.
@@ -184,19 +201,22 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    /// Spawn the scheduler task and return a shared handle to it.
-    pub fn spawn() -> Arc<Self> {
+    /// Spawn the scheduler task and return a shared handle to it. The `command`
+    /// channel is used to notify the RPC server when the queue sheds too many
+    /// requests (overload).
+    pub fn spawn(config: SchedulerConfig, command: Sender<Command>) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = Arc::new(Self { tx: tx.clone(), seq: AtomicU64::new(0) });
-        tokio::spawn(run(rx, tx));
+        tokio::spawn(run(rx, tx, config, command));
         handle
     }
 
     /// Register a request that is ready to serve. The returned [`Ticket`] keeps the
-    /// request in the queue until dropped; awaiting the receiver yields a [`Permit`]
-    /// once the scheduler grants the request. Only enqueue a request once its data
-    /// is available to stream — the queue holds ready requests exclusively.
-    pub fn enqueue(&self, info: ReqInfo) -> (Ticket, oneshot::Receiver<Permit>) {
+    /// request in the queue until dropped; awaiting the receiver yields a
+    /// [`GrantResult`] once the scheduler grants or evicts the request. Only
+    /// enqueue a request once its data is available to stream — the queue holds
+    /// ready requests exclusively.
+    pub fn enqueue(&self, info: ReqInfo) -> (Ticket, oneshot::Receiver<GrantResult>) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let (grant_tx, grant_rx) = oneshot::channel();
         let _ = self.tx.send(SchedMsg::Enqueue { seq, info, grant: grant_tx });
@@ -246,6 +266,42 @@ impl Permit {
     }
 }
 
+// --- Cache-refill concurrency limiter ------------------------------------------
+
+/// Caps the number of concurrent cache-miss refills. Acquisition is a load + CAS
+/// (`fetch_update`): if at capacity, no slot is taken and the caller should behave
+/// as if its serve timed out instead of starting a refill.
+pub struct RefillLimiter {
+    count: AtomicU64,
+    limit: u64,
+}
+
+impl RefillLimiter {
+    pub fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self { count: AtomicU64::new(0), limit })
+    }
+
+    /// Reserve a refill slot, returning a guard that releases it on drop. Returns
+    /// `None` when at capacity (refill should be skipped).
+    pub fn try_acquire(self: &Arc<Self>) -> Option<RefillPermit> {
+        self.count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.limit).then_some(n + 1))
+            .ok()
+            .map(|_| RefillPermit { limiter: self.clone() })
+    }
+}
+
+/// Holds a refill slot for the lifetime of a download worker; releases on drop.
+pub struct RefillPermit {
+    limiter: Arc<RefillLimiter>,
+}
+
+impl Drop for RefillPermit {
+    fn drop(&mut self) {
+        self.limiter.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pin_project! {
     /// Response body wrapper that holds a [`Permit`] for as long as the body lives.
     struct GuardBody {
@@ -277,9 +333,10 @@ impl HttpBody for GuardBody {
 
 // --- Scheduler task ------------------------------------------------------------
 
-async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<SchedMsg>) {
+async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<SchedMsg>, config: SchedulerConfig, command: Sender<Command>) {
     let mut queue: BTreeMap<Key, Waiter> = BTreeMap::new();
-    let mut limiters = RateLimiters::new();
+    let mut limiters = RateLimiters::new(&config);
+    let mut overload = OverloadTracker::new(config.overload_rate, config.overload_notify_interval, command);
 
     loop {
         // Dispatch as many requests as the limiters currently allow. Every queued
@@ -304,7 +361,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
                     // if `send` races a handler drop, the returned permit's End
                     // releases the capacity we just took.
                     limiters.on_start(now, &info);
-                    let _ = waiter.grant.send(Permit { tx: tx.clone(), info });
+                    let _ = waiter.grant.send(GrantResult::Granted(Permit { tx: tx.clone(), info }));
                 }
                 Decision::Blocked(wakeup) => break Some(wakeup),
             }
@@ -316,28 +373,79 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
                 tokio::select! {
                     biased;
                     msg = rx.recv() => match msg {
-                        Some(msg) => apply(msg, &mut queue, &mut limiters),
+                        Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload),
                         None => break,
                     },
                     _ = wakeup => {}
                 }
             }
             None => match rx.recv().await {
-                Some(msg) => apply(msg, &mut queue, &mut limiters),
+                Some(msg) => apply(msg, &mut queue, &mut limiters, &config, &mut overload),
                 None => break,
             },
         }
     }
 }
 
-fn apply(msg: SchedMsg, queue: &mut BTreeMap<Key, Waiter>, limiters: &mut RateLimiters) {
+fn apply(
+    msg: SchedMsg,
+    queue: &mut BTreeMap<Key, Waiter>,
+    limiters: &mut RateLimiters,
+    config: &SchedulerConfig,
+    overload: &mut OverloadTracker,
+) {
     match msg {
         SchedMsg::Enqueue { seq, info, grant } => {
             queue.insert((info.size, seq), Waiter { info, grant });
+            // Cap the queue: pushing past the limit evicts the largest (lowest
+            // priority) waiter so smallest-first dispatch is preserved.
+            if queue.len() > config.queue_limit
+                && let Some((_, waiter)) = queue.pop_last()
+            {
+                let _ = waiter.grant.send(GrantResult::Evicted);
+                overload.record_rejection();
+            }
         }
         SchedMsg::Remove { key } => {
             queue.remove(&key);
         }
         SchedMsg::End { info } => limiters.on_end(&info),
+    }
+}
+
+/// Tracks rejected (evicted) requests with a GCRA bucket sized to one minute of
+/// the configured rate. When sustained rejections exhaust the bucket, the RPC
+/// server is told we are overloaded — at most once per `notify_interval`.
+struct OverloadTracker {
+    gcra: GcraLimiter,
+    command: Sender<Command>,
+    notify_interval: Duration,
+    last_notify: Option<Instant>,
+}
+
+impl OverloadTracker {
+    fn new(rate: f64, notify_interval: Duration, command: Sender<Command>) -> Self {
+        let burst = (rate * 60.0).ceil() as u32;
+        Self {
+            gcra: GcraLimiter::new(rate, burst, |_| 1),
+            command,
+            notify_interval,
+            last_notify: None,
+        }
+    }
+
+    fn record_rejection(&mut self) {
+        let now = Instant::now();
+        let info = ReqInfo { size: 1 };
+        match self.gcra.check(now, &info) {
+            Decision::Ready => self.gcra.on_start(now, &info),
+            Decision::Blocked(_) => {
+                if self.last_notify.is_none_or(|last| now.duration_since(last) >= self.notify_interval) {
+                    self.last_notify = Some(now);
+                    warn!("Server overloaded!");
+                    let _ = self.command.try_send(Command::Overload);
+                }
+            }
+        }
     }
 }

@@ -35,7 +35,7 @@ use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
-    ratelimit::{Permit, ReqInfo, SERVE_TIMEOUT, SchedulerHandle},
+    ratelimit::{GrantResult, Permit, ReqInfo, SchedulerHandle},
     route::{forbidden, not_found, parse_additional},
     server::util::TruncateBody,
     util::{create_http_client, string_to_hash},
@@ -124,7 +124,7 @@ pub(super) async fn hath(
     // Clone the scheduler handle here because `data` is moved into the download
     // worker on a cache miss, so it is not available after that point.
     let scheduler = data.scheduler.clone();
-    let remaining = SERVE_TIMEOUT.saturating_sub(recv_time.elapsed());
+    let remaining = data.serve_timeout.saturating_sub(recv_time.elapsed());
 
     let served = timeout(remaining, async move {
         // Check cache hit
@@ -150,7 +150,8 @@ pub(super) async fn hath(
             };
             let permit = match schedule(&scheduler, &method, ReqInfo { size: resp_bytes }).await {
                 Ok(permit) => permit,
-                Err(()) => return not_found(),
+                Err(ScheduleError::Evicted) => return reset_connection(),
+                Err(ScheduleError::Closed) => return not_found(),
             };
             let response = if let Some(r) = range {
                 let content_length = r.end() - r.start() + 1;
@@ -177,12 +178,21 @@ pub(super) async fn hath(
         let (temp_tx, temp_rx) = watch::channel(None); // Tempfile
         let tx = Arc::new(watch::channel(0).0); // Download progress
         let state;
+        let refill_permit;
         {
             let mut download_state = data.download_state.lock();
             state = download_state.get(&info.hash()).cloned();
-            // Tracking download progress
+            // We only initiate a refill when no download is in flight for this file.
+            // Reserve a refill slot first; if we are at capacity, skip the refill
+            // entirely and behave as if the serve timed out.
             if state.is_none() {
+                match data.refill_limiter.try_acquire() {
+                    Some(permit) => refill_permit = Some(permit),
+                    None => return reset_connection(),
+                }
                 download_state.insert(info.hash(), (temp_rx.clone(), tx.clone()));
+            } else {
+                refill_permit = None;
             }
         }
 
@@ -220,6 +230,7 @@ pub(super) async fn hath(
             let info2 = info.clone();
             let temp_path2 = temp_path.clone();
             tokio::spawn(async move {
+                let _refill_permit = refill_permit; // released when refill finishes
                 let download_time = Instant::now();
                 let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
                 let mut progress = 0;
@@ -333,7 +344,8 @@ pub(super) async fn hath(
         // charged size is the full file.
         let permit = match schedule(&scheduler, &method, ReqInfo { size: info.size() }).await {
             Ok(permit) => permit,
-            Err(()) => return not_found(),
+            Err(ScheduleError::Evicted) => return reset_connection(),
+            Err(ScheduleError::Closed) => return not_found(),
         };
 
         let response = response
@@ -393,12 +405,24 @@ pub(super) async fn hath(
 /// if the caller's timeout cancels this future, dropping the ticket removes the
 /// request from the queue. HEAD requests are not scheduled (they carry no body):
 /// they serve immediately without a permit, bypassing the rate limiters entirely.
-async fn schedule(scheduler: &SchedulerHandle, method: &Method, info: ReqInfo) -> Result<Option<Permit>, ()> {
+async fn schedule(scheduler: &SchedulerHandle, method: &Method, info: ReqInfo) -> Result<Option<Permit>, ScheduleError> {
     if *method == Method::HEAD {
         return Ok(None);
     }
     let (_ticket, grant) = scheduler.enqueue(info);
-    grant.await.map(Some).map_err(|_| ())
+    match grant.await {
+        Ok(GrantResult::Granted(permit)) => Ok(Some(permit)),
+        Ok(GrantResult::Evicted) => Err(ScheduleError::Evicted),
+        Err(_) => Err(ScheduleError::Closed),
+    }
+}
+
+/// Why a request could not be served by the scheduler.
+enum ScheduleError {
+    /// Evicted from the queue (capacity): behave as if the serve timed out.
+    Evicted,
+    /// The scheduler dropped the grant: treat as not found.
+    Closed,
 }
 
 /// Attach a serve permit to a response body, if one was issued. Unscheduled
