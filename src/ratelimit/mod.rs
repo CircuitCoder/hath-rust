@@ -1,11 +1,13 @@
 //! Generic serve scheduler + rate limiting for the file-serving (`/h/`) route.
 //!
 //! # Flow
-//! 1. The handler determines the response size and [`enqueue`]s a request.
-//! 2. The request sits in a priority queue (smallest response first) until it is
-//!    both *ready* (data available to stream) and allowed by every rate limiter.
-//! 3. A single owner task ([`run`]) dispatches the smallest ready request whenever
-//!    all limiters allow, handing back a [`Permit`] that is held for the whole
+//! 1. The handler determines the response size and, *once the data is ready to
+//!    stream*, [`enqueue`]s the request.
+//! 2. The request sits in a priority queue (smallest response first) until every
+//!    rate limiter allows it. Only ready requests are ever enqueued, so every
+//!    entry in the queue is immediately servable.
+//! 3. A single owner task ([`run`]) dispatches the smallest request whenever all
+//!    limiters allow, handing back a [`Permit`] that is held for the whole
 //!    response body.
 //! 4. If the handler's own timeout elapses first, it drops its [`Ticket`], which
 //!    removes the request from the queue, and resets the connection.
@@ -71,7 +73,9 @@ const CONCURRENCY_LIMIT: usize = 200;
 /// Information about a request that rate limiters may use for their decisions.
 #[derive(Clone, Copy)]
 pub struct ReqInfo {
-    /// Response size in bytes; also the scheduling priority (smallest first).
+    /// Number of bytes the response will actually transfer (0 for HEAD, the range
+    /// length for range requests, otherwise the full file size). Used both as the
+    /// scheduling priority (smallest first) and as the bandwidth limiter's cost.
     pub size: u32,
 }
 
@@ -155,9 +159,6 @@ enum SchedMsg {
         info: ReqInfo,
         grant: oneshot::Sender<Permit>,
     },
-    SetReady {
-        key: Key,
-    },
     Remove {
         key: Key,
     },
@@ -168,7 +169,6 @@ enum SchedMsg {
 
 struct Waiter {
     info: ReqInfo,
-    ready: bool,
     grant: oneshot::Sender<Permit>,
 }
 
@@ -192,10 +192,10 @@ impl SchedulerHandle {
         handle
     }
 
-    /// Register a request. The returned [`Ticket`] keeps the request in the queue
-    /// until dropped; awaiting the receiver yields a [`Permit`] once the scheduler
-    /// grants the request. Newly enqueued requests start *not ready*; call
-    /// [`Ticket::set_ready`] once data is available to stream.
+    /// Register a request that is ready to serve. The returned [`Ticket`] keeps the
+    /// request in the queue until dropped; awaiting the receiver yields a [`Permit`]
+    /// once the scheduler grants the request. Only enqueue a request once its data
+    /// is available to stream — the queue holds ready requests exclusively.
     pub fn enqueue(&self, info: ReqInfo) -> (Ticket, oneshot::Receiver<Permit>) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let (grant_tx, grant_rx) = oneshot::channel();
@@ -216,13 +216,6 @@ impl SchedulerHandle {
 pub struct Ticket {
     key: Key,
     tx: UnboundedSender<SchedMsg>,
-}
-
-impl Ticket {
-    /// Mark the request as ready to serve (data is available to stream).
-    pub fn set_ready(&self) {
-        let _ = self.tx.send(SchedMsg::SetReady { key: self.key });
-    }
 }
 
 impl Drop for Ticket {
@@ -289,18 +282,18 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
     let mut limiters = RateLimiters::new();
 
     loop {
-        // Dispatch as many ready requests as the limiters currently allow.
+        // Dispatch as many requests as the limiters currently allow. Every queued
+        // request is ready to serve, so the smallest-key entry (smallest response,
+        // then arrival order) is always the next candidate — an O(log n) peek.
         let wakeup = loop {
             let now = Instant::now();
-            // Smallest-size ready request (BTreeMap iterates in key order).
-            let key = queue.iter().find(|(_, w)| w.ready).map(|(k, _)| *k);
-            let Some(key) = key else {
-                break None; // Nothing ready to serve.
+            let Some((_, waiter)) = queue.first_key_value() else {
+                break None; // Queue empty.
             };
-            let info = queue[&key].info;
+            let info = waiter.info;
             match limiters.check(now, &info) {
                 Decision::Ready => {
-                    let waiter = queue.remove(&key).expect("key just observed");
+                    let (_, waiter) = queue.pop_first().expect("queue just observed non-empty");
                     // Skip handlers that already gave up so we don't consume capacity
                     // for a serve that will never happen.
                     if waiter.grant.is_closed() {
@@ -340,12 +333,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<SchedMsg>, tx: UnboundedSender<Sche
 fn apply(msg: SchedMsg, queue: &mut BTreeMap<Key, Waiter>, limiters: &mut RateLimiters) {
     match msg {
         SchedMsg::Enqueue { seq, info, grant } => {
-            queue.insert((info.size, seq), Waiter { info, ready: false, grant });
-        }
-        SchedMsg::SetReady { key } => {
-            if let Some(waiter) = queue.get_mut(&key) {
-                waiter.ready = true;
-            }
+            queue.insert((info.size, seq), Waiter { info, grant });
         }
         SchedMsg::Remove { key } => {
             queue.remove(&key);

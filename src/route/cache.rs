@@ -11,7 +11,7 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, IF_RANGE,
             RANGE,
@@ -35,7 +35,7 @@ use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
-    ratelimit::{ReqInfo, SERVE_TIMEOUT},
+    ratelimit::{Permit, ReqInfo, SERVE_TIMEOUT, SchedulerHandle},
     route::{forbidden, not_found, parse_additional},
     server::util::TruncateBody,
     util::{create_http_client, string_to_hash},
@@ -47,6 +47,7 @@ const DEFAULT_CD: HeaderValue = HeaderValue::from_static("inline");
 
 pub(super) async fn hath(
     Path((file_id, additional, file_name)): Path<(String, String, String)>,
+    method: Method,
     headers: HeaderMap,
     data: State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -115,11 +116,14 @@ pub(super) async fn hath(
         .header(CONTENT_TYPE, content_type)
         .header(ETAG, etag);
 
-    // Enqueue into the serve scheduler: requests are rate limited and ordered by
-    // response size. The ticket keeps the request in the queue until it is served
-    // or dropped (timeout / early error). The timeout is measured from receipt.
-    let (ticket, grant_rx) = data.scheduler.enqueue(ReqInfo { size: info.size() });
-    let ticket_ref = &ticket;
+    // The serve scheduler / rate limiters are applied at the moment a request
+    // becomes ready to stream (see `schedule` below): a request is only enqueued
+    // once its data is available, so the queue holds none-but-ready requests. The
+    // timeout is still measured from receipt.
+    //
+    // Clone the scheduler handle here because `data` is moved into the download
+    // worker on a cache miss, so it is not available after that point.
+    let scheduler = data.scheduler.clone();
     let remaining = SERVE_TIMEOUT.saturating_sub(recv_time.elapsed());
 
     let served = timeout(remaining, async move {
@@ -137,9 +141,17 @@ pub(super) async fn hath(
         };
 
         if let Some(stream) = file_stream {
-            // Cache hit: data is available immediately.
-            ticket_ref.set_ready();
-            let Ok(permit) = grant_rx.await else { return not_found() };
+            // Cache hit: data is available immediately, so schedule now. The
+            // response size charged is what we will actually send (range length,
+            // else the full file).
+            let resp_bytes = match range.as_ref() {
+                Some(r) => (r.end() - r.start() + 1) as u32,
+                None => info.size(),
+            };
+            let permit = match schedule(&scheduler, &method, ReqInfo { size: resp_bytes }).await {
+                Ok(permit) => permit,
+                Err(()) => return not_found(),
+            };
             let response = if let Some(r) = range {
                 let content_length = r.end() - r.start() + 1;
                 let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
@@ -157,7 +169,7 @@ pub(super) async fn hath(
                     .body(Body::from_stream(stream))
                     .unwrap()
             };
-            return response.map(|b| permit.guard(b));
+            return response.map(|b| guard_with(permit, b));
         }
 
         // Cache miss, proxy request
@@ -316,9 +328,13 @@ pub(super) async fn hath(
             return not_found();
         }
 
-        // Refill has started: data is now available to stream.
-        ticket_ref.set_ready();
-        let Ok(permit) = grant_rx.await else { return not_found() };
+        // Refill has started: data is now available to stream, so schedule now. A
+        // miss does not honor the range — the whole file is streamed — so the
+        // charged size is the full file.
+        let permit = match schedule(&scheduler, &method, ReqInfo { size: info.size() }).await {
+            Ok(permit) => permit,
+            Err(()) => return not_found(),
+        };
 
         let response = response
             .header(CONTENT_LENGTH, file_size)
@@ -353,18 +369,44 @@ pub(super) async fn hath(
                 }
             }))
             .unwrap();
-        response.map(|b| permit.guard(b))
+        response.map(|b| guard_with(permit, b))
     })
     .await;
 
     match served {
         Ok(response) => response,
         Err(_) => {
-            // Timed out waiting in the serve pool: remove from the queue (via the
-            // ticket's Drop) and reset the connection.
-            drop(ticket);
+            // Timed out waiting in the serve pool. If the request had already been
+            // enqueued (it reached the ready point), cancelling the serve future
+            // drops its Ticket, which removes it from the queue; reset the
+            // connection.
             reset_connection()
         }
+    }
+}
+
+/// Schedule a ready-to-serve request and acquire its serve permit.
+///
+/// GET requests are enqueued into the scheduler and we await the grant, yielding
+/// `Some(permit)` to hold for the response body, or `Err` if the scheduler dropped
+/// the grant (treated as not found). The `Ticket` is held across the await so that
+/// if the caller's timeout cancels this future, dropping the ticket removes the
+/// request from the queue. HEAD requests are not scheduled (they carry no body):
+/// they serve immediately without a permit, bypassing the rate limiters entirely.
+async fn schedule(scheduler: &SchedulerHandle, method: &Method, info: ReqInfo) -> Result<Option<Permit>, ()> {
+    if *method == Method::HEAD {
+        return Ok(None);
+    }
+    let (_ticket, grant) = scheduler.enqueue(info);
+    grant.await.map(Some).map_err(|_| ())
+}
+
+/// Attach a serve permit to a response body, if one was issued. Unscheduled
+/// requests (HEAD) carry no permit and the body is returned unchanged.
+fn guard_with(permit: Option<Permit>, body: Body) -> Body {
+    match permit {
+        Some(permit) => permit.guard(body),
+        None => body,
     }
 }
 
