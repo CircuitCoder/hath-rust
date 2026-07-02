@@ -1,8 +1,12 @@
-use std::{fmt::Error, sync::atomic::AtomicU64, time::Instant};
+use std::{
+    fmt::{Error, Write},
+    sync::atomic::AtomicU64,
+    time::Instant,
+};
 
 use prometheus_client::{
     collector::Collector,
-    encoding::{DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric},
+    encoding::{DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric, LabelValueEncoder},
     metrics::{
         counter::{ConstCounter, Counter},
         family::Family,
@@ -24,7 +28,8 @@ pub const LABEL_CACHE_DOWNLOAD: CacheFetchLabels = CacheFetchLabels {
 
 pub struct Metrics {
     pub registry: Registry,
-    pub cache_sent: Counter,
+    pub cache_sent: Family<RequestLabel, Counter>,
+    pub cache_sent_status: Family<StatusLabel, Counter>,
     pub cache_sent_size: Family<Vec<(String, String)>, Counter>,
     pub cache_sent_duration: Family<Vec<(String, String)>, Histogram>,
     pub cache_received: Counter,
@@ -47,7 +52,8 @@ impl Metrics {
         let mut registry = Registry::with_prefix("hath");
 
         // Request metrics
-        let cache_sent = Counter::default();
+        let cache_sent = Family::<RequestLabel, Counter>::default();
+        let cache_sent_status = Family::<StatusLabel, Counter>::default();
         let cache_sent_size = Family::<Vec<(String, String)>, Counter>::default();
         let cache_sent_duration = Family::<Vec<(String, String)>, Histogram>::new_with_constructor(|| {
             Histogram::new([0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0])
@@ -59,6 +65,7 @@ impl Metrics {
         });
         let connections = Gauge::<u64, AtomicU64>::default();
         registry.register("cache_sent", "Number of files sent", cache_sent.clone());
+        registry.register("cache_sent_status", "Number of responses sent by HTTP status code", cache_sent_status.clone());
         registry.register_with_unit("cache_sent_size", "Number of bytes sent", Bytes, cache_sent_size.clone());
         registry.register_with_unit("cache_sent_duration", "Histogram of cache sent", Seconds, cache_sent_duration.clone());
         registry.register("cache_received", "Number of files received", cache_received.clone());
@@ -96,6 +103,7 @@ impl Metrics {
         Self {
             registry,
             cache_sent,
+            cache_sent_status,
             cache_sent_size,
             cache_sent_duration,
             cache_received,
@@ -119,6 +127,34 @@ impl Metrics {
     pub fn register_scheduler(&mut self, collector: crate::ratelimit::SchedulerCollector) {
         self.registry.register_collector(Box::new(collector));
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MethodLabel {
+    Get,
+    Head,
+    Other,
+}
+
+impl EncodeLabelValue for MethodLabel {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), Error> {
+        encoder.write_str(match self {
+            MethodLabel::Get => "GET",
+            MethodLabel::Head => "HEAD",
+            MethodLabel::Other => "OTHER",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+pub struct RequestLabel {
+    pub method: MethodLabel,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+pub struct StatusLabel {
+    pub code: u16,
+    pub method: MethodLabel,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
