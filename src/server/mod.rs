@@ -21,7 +21,7 @@ use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
-use log::{error, info};
+use log::{debug, info};
 use parking_lot::Mutex;
 use quinn::{BloomTokenLog, Endpoint, TransportConfig, ValidationTokenConfig, crypto::rustls::QuicServerConfig};
 use rustls::{
@@ -44,7 +44,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub use crate::server::{cert::ParsedCert, util::ClientAddr};
 use crate::{
     AppState, middleware, route,
-    server::{cert::CertStore, util::FloodControl},
+    server::{cert::CertStore, util::FloodControl, util::ResetConnection},
     util::{aes_support, ssl_provider},
 };
 
@@ -427,6 +427,13 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
                     let mut service = Extension(ClientAddr(addr)).layer(router.clone());
                     let (parts, mut body) = service.call(request).await.unwrap().into_parts();
 
+                    // Pre-body rejection (serve timeout / capacity): reset the request
+                    // stream without sending any response head, so no status leaks.
+                    if parts.extensions.get::<ResetConnection>().is_some() {
+                        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+                        return;
+                    }
+
                     // Build response
                     let mut response = Response::from_parts(parts, ());
                     let header = response.headers_mut();
@@ -451,8 +458,10 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
                                 }
                             }
                             Err(err) => {
-                                error!("{{h3/{addr}}} Failed to read stream: {err}");
-                                stream.stop_stream(Code::H3_INTERNAL_ERROR);
+                                // Includes intentional load-shed resets (the body
+                                // errors to reset the stream once the head is sent).
+                                debug!("{{h3/{addr}}} Failed to read stream: {err}");
+                                stream.stop_stream(Code::H3_REQUEST_CANCELLED);
                                 return;
                             }
                         }

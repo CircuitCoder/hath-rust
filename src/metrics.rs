@@ -32,6 +32,7 @@ pub struct Metrics {
     pub cache_sent_status: Family<StatusLabel, Counter>,
     pub cache_sent_size: Family<Vec<(String, String)>, Counter>,
     pub cache_sent_duration: Family<Vec<(String, String)>, Histogram>,
+    pub cache_response_size: Histogram,
     pub cache_received: Counter,
     pub cache_received_size: Counter,
     pub cache_received_duration: Family<CacheFetchLabels, Histogram>,
@@ -64,10 +65,13 @@ impl Metrics {
             Histogram::new([0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0])
         });
         let connections = Gauge::<u64, AtomicU64>::default();
+        // Response body size distribution (GET only): 10 KiB, ×4 per bucket, up to 20 MiB.
+        let cache_response_size = Histogram::new([10240.0, 40960.0, 163840.0, 655360.0, 2621440.0, 10485760.0, 20971520.0]);
         registry.register("cache_sent", "Number of files sent", cache_sent.clone());
         registry.register("cache_sent_status", "Number of responses sent by HTTP status code", cache_sent_status.clone());
         registry.register_with_unit("cache_sent_size", "Number of bytes sent", Bytes, cache_sent_size.clone());
         registry.register_with_unit("cache_sent_duration", "Histogram of cache sent", Seconds, cache_sent_duration.clone());
+        registry.register_with_unit("cache_response_size", "Histogram of response body size (GET only)", Bytes, cache_response_size.clone());
         registry.register("cache_received", "Number of files received", cache_received.clone());
         registry.register_with_unit("cache_received_size", "Number of bytes received", Bytes, cache_received_size.clone());
         registry.register_with_unit("cache_received_duration", "Histogram of cache received", Seconds, cache_received_duration.clone());
@@ -106,6 +110,7 @@ impl Metrics {
             cache_sent_status,
             cache_sent_size,
             cache_sent_duration,
+            cache_response_size,
             cache_received,
             cache_received_size,
             cache_received_duration,

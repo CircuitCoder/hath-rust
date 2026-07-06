@@ -20,9 +20,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use http_range_header::parse_range_header;
 use log::error;
+use prometheus_client::metrics::counter::Counter;
 use reqwest::IntoUrl;
 use tokio::{
     fs::{File, OpenOptions},
@@ -35,9 +36,9 @@ use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
-    ratelimit::{GrantResult, Permit, ReqInfo, SchedulerHandle},
+    ratelimit::{GrantResult, ReqInfo, SchedulerHandle},
     route::{forbidden, not_found, parse_additional},
-    server::util::TruncateBody,
+    server::util::{ResetConnection, TruncateBody},
     util::{create_http_client, string_to_hash},
 };
 
@@ -116,16 +117,28 @@ pub(super) async fn hath(
         .header(CONTENT_TYPE, content_type)
         .header(ETAG, etag);
 
-    // The serve scheduler / rate limiters are applied at the moment a request
-    // becomes ready to stream (see `schedule` below): a request is only enqueued
-    // once its data is available, so the queue holds none-but-ready requests. The
-    // timeout is still measured from receipt.
+    // A request becomes eligible for scheduling once its response size is known
+    // and its data is ready to stream. At that point the response *head* is built
+    // and returned immediately; the wait for scheduler capacity happens inside the
+    // response *body* (see `build_body`). Headers are therefore delivered as soon
+    // as possible, and only the body blocks on available resources.
     //
-    // Clone the scheduler handle here because `data` is moved into the download
-    // worker on a cache miss, so it is not available after that point.
+    // The head-producing phase below is bounded by the serve timeout (a cache miss
+    // does network work here); exceeding it resets the connection *before* any head
+    // is sent. Once the head is built, the in-body wait is bounded by the remaining
+    // serve timeout, and a timeout/eviction there resets the (already-headed)
+    // stream instead — no status code is ever emitted for a timed-out request.
+    //
+    // Clone shared handles here because `data` is moved into the download worker on
+    // a cache miss, so it is not available after that point.
     let scheduler = data.scheduler.clone();
     let timeout_metric = data.metrics.serve_timeout.clone();
-    let remaining = data.serve_timeout.saturating_sub(recv_time.elapsed());
+    let body_timeout_metric = timeout_metric.clone();
+    let serve_timeout = data.serve_timeout;
+    // Everything except HEAD carries a body and is scheduled; HEAD serves no body
+    // and bypasses the rate limiters entirely.
+    let schedule_body = method != Method::HEAD;
+    let remaining = serve_timeout.saturating_sub(recv_time.elapsed());
 
     let served = timeout(remaining, async move {
         // Check cache hit
@@ -142,18 +155,21 @@ pub(super) async fn hath(
         };
 
         if let Some(stream) = file_stream {
-            // Cache hit: data is available immediately, so schedule now. The
-            // response size charged is what we will actually send (range length,
-            // else the full file).
+            // Cache hit: data is available immediately. The response size charged is
+            // what we will actually send (range length, else the full file).
             let resp_bytes = match range.as_ref() {
                 Some(r) => (r.end() - r.start() + 1) as u32,
                 None => info.size(),
             };
-            let permit = match schedule(&scheduler, &method, ReqInfo { size: resp_bytes }).await {
-                Ok(permit) => permit,
-                Err(ScheduleError::Evicted) => return reset_connection(),
-                Err(ScheduleError::Closed) => return not_found(),
-            };
+            let body = build_body(
+                schedule_body,
+                scheduler,
+                ReqInfo { size: resp_bytes },
+                recv_time,
+                serve_timeout,
+                body_timeout_metric,
+                stream,
+            );
             let response = if let Some(r) = range {
                 let content_length = r.end() - r.start() + 1;
                 let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
@@ -162,16 +178,16 @@ pub(super) async fn hath(
                     .header(CONTENT_LENGTH, content_length)
                     .header(CONTENT_RANGE, content_range)
                     .status(StatusCode::PARTIAL_CONTENT)
-                    .body(Body::new(TruncateBody::new(Body::from_stream(stream), content_length)))
+                    .body(Body::new(TruncateBody::new(body, content_length)))
                     .unwrap()
             } else {
                 response
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_LENGTH, file_size)
-                    .body(Body::from_stream(stream))
+                    .body(body)
                     .unwrap()
             };
-            return response.map(|b| guard_with(permit, b));
+            return response;
         }
 
         // Cache miss, proxy request
@@ -340,112 +356,146 @@ pub(super) async fn hath(
             return not_found();
         }
 
-        // Refill has started: data is now available to stream, so schedule now. A
-        // miss does not honor the range — the whole file is streamed — so the
-        // charged size is the full file.
-        let permit = match schedule(&scheduler, &method, ReqInfo { size: info.size() }).await {
-            Ok(permit) => permit,
-            Err(ScheduleError::Evicted) => return reset_connection(),
-            Err(ScheduleError::Closed) => return not_found(),
-        };
+        // Refill has started: data is now available to stream, so scheduling can
+        // proceed inside the body. A miss does not honor the range — the whole file
+        // is streamed — so the charged size is the full file.
+        let inner = stream! {
+            let mut file = File::open(temp_path.as_ref()).await.unwrap();
+            let mut read_off = 0;
+            let mut write_off = *rx.borrow();
 
-        let response = response
-            .header(CONTENT_LENGTH, file_size)
-            .body(Body::from_stream(stream! {
-                let mut file = File::open(temp_path.as_ref()).await.unwrap();
-                let mut read_off = 0;
-                let mut write_off = *rx.borrow();
+            let wait_time = Duration::from_secs(30);
+            'watch: while write_off > read_off || timeout(wait_time, rx.changed()).await.is_ok_and(|r| r.is_ok()) {
+                write_off = *rx.borrow();
 
-                let wait_time = Duration::from_secs(30);
-                'watch: while write_off > read_off || timeout(wait_time, rx.changed()).await.is_ok_and(|r| r.is_ok()) {
-                    write_off = *rx.borrow();
-
-                    let mut buffer = BytesMut::with_capacity(64*1024); // 64 KiB
-                    while write_off > read_off {
-                        buffer.reserve(64*1024);
-                        match file.read_buf(&mut buffer).await {
-                            Ok(0) => {
-                                // Data may not synced to disk, retry later
-                                sleep(Duration::from_millis(10)).await;
-                                continue;
-                            }
-                            Ok(s) => read_off += s as u64,
-                            Err(err) => yield Err(err)
+                let mut buffer = BytesMut::with_capacity(64*1024); // 64 KiB
+                while write_off > read_off {
+                    buffer.reserve(64*1024);
+                    match file.read_buf(&mut buffer).await {
+                        Ok(0) => {
+                            // Data may not synced to disk, retry later
+                            sleep(Duration::from_millis(10)).await;
+                            continue;
                         }
-                        yield Ok(buffer.split().freeze());
+                        Ok(s) => read_off += s as u64,
+                        Err(err) => yield Err(err)
+                    }
+                    yield Ok(buffer.split().freeze());
 
-                        // EOF
-                        if read_off == file_size {
-                            break 'watch;
-                        }
+                    // EOF
+                    if read_off == file_size {
+                        break 'watch;
                     }
                 }
-            }))
-            .unwrap();
-        response.map(|b| guard_with(permit, b))
+            }
+        };
+        response
+            .header(CONTENT_LENGTH, file_size)
+            .body(build_body(
+                schedule_body,
+                scheduler,
+                ReqInfo { size: info.size() },
+                recv_time,
+                serve_timeout,
+                body_timeout_metric,
+                inner,
+            ))
+            .unwrap()
     })
     .await;
 
     match served {
         Ok(response) => response,
         Err(_) => {
-            // Timed out waiting in the serve pool. If the request had already been
-            // enqueued (it reached the ready point), cancelling the serve future
-            // drops its Ticket, which removes it from the queue; reset the
-            // connection.
+            // Timed out during the head-producing phase (a cache miss doing network
+            // work), before any head was sent. Reset the connection.
             timeout_metric.inc();
             reset_connection()
         }
     }
 }
 
-/// Schedule a ready-to-serve request and acquire its serve permit.
+/// Build the response body for a ready-to-serve request.
 ///
-/// GET requests are enqueued into the scheduler and we await the grant, yielding
-/// `Some(permit)` to hold for the response body, or `Err` if the scheduler dropped
-/// the grant (treated as not found). The `Ticket` is held across the await so that
-/// if the caller's timeout cancels this future, dropping the ticket removes the
-/// request from the queue. HEAD requests are not scheduled (they carry no body):
-/// they serve immediately without a permit, bypassing the rate limiters entirely.
-async fn schedule(scheduler: &SchedulerHandle, method: &Method, info: ReqInfo) -> Result<Option<Permit>, ScheduleError> {
-    if *method == Method::HEAD {
-        return Ok(None);
+/// HEAD requests carry no body and are not scheduled: they return immediately with
+/// an empty body, bypassing the rate limiters.
+///
+/// For every other method the returned body first enqueues the request into the
+/// scheduler and awaits its grant *inside the stream*, so the response head has
+/// already been delivered by the time this runs. Holding the [`Ticket`] across the
+/// grant await means a client disconnect (body dropped) still removes the request
+/// from the queue. Once granted, the [`Permit`] is held for the whole body and the
+/// inner data stream is forwarded. If the request times out, is evicted, or the
+/// scheduler is gone, the body errors so the connection/stream is reset instead of
+/// finishing normally — no status code is emitted, matching the timeout semantics.
+fn build_body<S>(
+    schedule: bool,
+    scheduler: Arc<SchedulerHandle>,
+    info: ReqInfo,
+    recv_time: Instant,
+    serve_timeout: Duration,
+    timeout_metric: Counter,
+    inner: S,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    if !schedule {
+        return Body::empty();
     }
-    let (_ticket, grant) = scheduler.enqueue(info);
-    match grant.await {
-        Ok(GrantResult::Granted(permit)) => Ok(Some(permit)),
-        Ok(GrantResult::Evicted) => Err(ScheduleError::Evicted),
-        Err(_) => Err(ScheduleError::Closed),
-    }
+    Body::from_stream(stream! {
+        let (_ticket, grant) = scheduler.enqueue(info);
+        let remaining = serve_timeout.saturating_sub(recv_time.elapsed());
+        let _permit = match timeout(remaining, grant).await {
+            Ok(Ok(GrantResult::Granted(permit))) => permit,
+            Err(_) => {
+                // Timed out waiting for scheduler capacity. The head is already on
+                // the wire, so error the body to reset the connection/stream.
+                timeout_metric.inc();
+                yield Err::<Bytes, _>(reset_error());
+                return;
+            }
+            // Evicted from the queue (capacity) or the scheduler is gone: reset.
+            Ok(Ok(GrantResult::Evicted)) | Ok(Err(_)) => {
+                yield Err::<Bytes, _>(reset_error());
+                return;
+            }
+        };
+        // `_permit` is held for the whole body; dropping it releases the serve.
+        let mut inner = std::pin::pin!(inner);
+        while let Some(item) = inner.next().await {
+            match item {
+                Ok(bytes) => yield Ok(bytes),
+                Err(err) => {
+                    yield Err(err);
+                    return;
+                }
+            }
+        }
+    })
 }
 
-/// Why a request could not be served by the scheduler.
-enum ScheduleError {
-    /// Evicted from the queue (capacity): behave as if the serve timed out.
-    Evicted,
-    /// The scheduler dropped the grant: treat as not found.
-    Closed,
-}
-
-/// Attach a serve permit to a response body, if one was issued. Unscheduled
-/// requests (HEAD) carry no permit and the body is returned unchanged.
-fn guard_with(permit: Option<Permit>, body: Body) -> Body {
-    match permit {
-        Some(permit) => permit.guard(body),
-        None => body,
-    }
+/// Error used to abort a response body so the connection/stream is reset rather
+/// than finishing normally.
+fn reset_error() -> std::io::Error {
+    std::io::Error::other("serve reset")
 }
 
 /// Build a response that resets the connection instead of sending a complete
-/// reply. Used when a request times out in the serve pool: the body errors
-/// immediately so hyper tears the connection down rather than finishing normally.
+/// reply. Used for pre-body rejections (serve timeout during the head-producing
+/// phase, refill at capacity): the body errors on its first poll so hyper tears
+/// the connection down before writing any head (HTTP/1.1), and the [`ResetConnection`]
+/// extension tells the HTTP/3 server loop to reset the stream before sending a
+/// response. No status code is delivered in either case.
 fn reset_connection() -> Response {
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from_stream(stream! {
-            yield Err::<Bytes, _>(std::io::Error::other("serve timeout"));
+            yield Err::<Bytes, _>(reset_error());
         }))
-        .unwrap()
+        .unwrap();
+    response.extensions_mut().insert(ResetConnection);
+    response
 }
 
 /// Helper function to add url to reqwest error

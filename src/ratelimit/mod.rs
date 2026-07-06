@@ -26,16 +26,11 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    task::{Context, Poll},
     time::Duration,
 };
 
-use axum::body::Body;
-use bytes::Bytes;
 use futures::future::select_all;
-use http_body::Body as HttpBody;
 use log::warn;
-use pin_project_lite::pin_project;
 use tokio::{
     sync::{
         mpsc::{self, Sender, UnboundedSender},
@@ -272,7 +267,8 @@ impl Drop for Ticket {
 
 /// Proof that a serve was granted by every rate limiter. Must be held for the
 /// entire response body; dropping it releases the serve (semaphore-style limiters
-/// react to this).
+/// react to this). The body handler keeps it alive inside its response stream for
+/// the whole duration of the transfer.
 pub struct Permit {
     tx: UnboundedSender<SchedMsg>,
     info: ReqInfo,
@@ -281,14 +277,6 @@ pub struct Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         let _ = self.tx.send(SchedMsg::End { info: self.info });
-    }
-}
-
-impl Permit {
-    /// Attach this permit to a response so it is released when the body is fully
-    /// sent or dropped (e.g. client disconnect mid-stream).
-    pub fn guard(self, body: Body) -> Body {
-        Body::new(GuardBody { inner: body, _permit: self })
     }
 }
 
@@ -330,35 +318,6 @@ pub struct RefillPermit {
 impl Drop for RefillPermit {
     fn drop(&mut self) {
         self.limiter.count.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pin_project! {
-    /// Response body wrapper that holds a [`Permit`] for as long as the body lives.
-    struct GuardBody {
-        #[pin]
-        inner: Body,
-        _permit: Permit,
-    }
-}
-
-impl HttpBody for GuardBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
     }
 }
 

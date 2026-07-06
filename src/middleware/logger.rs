@@ -121,6 +121,7 @@ where
                 start,
                 body_start: Instant::now(),
                 version,
+                is_get: method_label == MethodLabel::Get,
                 metrics,
             }))
         })
@@ -138,6 +139,7 @@ pin_project! {
         start: std::time::Instant,
         body_start: std::time::Instant,
         version: Version,
+        is_get: bool,
         metrics: Arc<Metrics>,
     }
 
@@ -154,6 +156,9 @@ pin_project! {
             // TODO replace label with enum
             this.metrics.cache_sent_size.get_or_create(&vec![("version".to_owned(), format!("{:?}", this.version))]).inc_by(this.size);
             this.metrics.cache_sent_duration.get_or_create(&vec![("version".to_owned(), format!("{:?}", this.version))]).observe(this.start.elapsed().as_secs_f64());
+            if this.is_get {
+                this.metrics.cache_response_size.observe(this.size as f64);
+            }
         }
     }
 }
