@@ -1,17 +1,15 @@
 mod connection_counter;
 mod logger;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use axum::{
     Router,
-    error_handling::HandleErrorLayer,
-    http::{HeaderValue, StatusCode, header::SERVER},
+    http::{HeaderValue, header::SERVER},
     middleware,
     response::Response,
 };
 use const_format::concatcp;
-use tower::{ServiceBuilder, timeout::TimeoutLayer};
 
 use crate::{
     AppState, CLIENT_VERSION,
@@ -22,11 +20,6 @@ static SERVER_HEADER: HeaderValue = HeaderValue::from_static(concatcp!("Genetic 
 
 pub fn register_layer(router: Router<Arc<AppState>>, data: &AppState, server_header: bool) -> Router<Arc<AppState>> {
     let mut router = router
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(|_| async { StatusCode::SERVICE_UNAVAILABLE }))
-                .layer(TimeoutLayer::new(Duration::from_secs(181))),
-        )
         .layer(Logger::new(data.metrics.clone()))
         .layer(ConnectionCounter::new(data.metrics.connections.clone()));
 

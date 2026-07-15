@@ -3,14 +3,13 @@
 //! # Flow
 //! 1. The handler determines the response size and, *once the data is ready to
 //!    stream*, [`enqueue`]s the request.
-//! 2. The request sits in a priority queue (smallest response first) until every
-//!    rate limiter allows it. Only ready requests are ever enqueued, so every
-//!    entry in the queue is immediately servable.
-//! 3. A single owner task ([`run`]) dispatches the smallest request whenever all
-//!    limiters allow, handing back a [`Permit`] that is held for the whole
-//!    response body.
-//! 4. If the handler's own timeout elapses first, it drops its [`Ticket`], which
-//!    removes the request from the queue, and resets the connection.
+//! 2. The body simultaneously waits for slow-drain capacity and enqueues for a
+//!    normal grant. Only ready requests are enqueued.
+//! 3. Slow-drain capacity starts a paced response while the request remains in
+//!    the priority queue. A normal grant upgrades it to full speed and returns
+//!    the slow-drain slot.
+//! 4. If neither grant arrives before the handler's timeout, dropping the body
+//!    removes its [`Ticket`] from the queue and cancels its slow-drain waiter.
 //!
 //! Concurrency is handled by single ownership: the queue and all limiter state
 //! live inside the [`run`] task and are mutated only via messages, so no shared
@@ -21,6 +20,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
+    num::NonZeroU64,
     pin::Pin,
     sync::{
         Arc,
@@ -34,7 +34,7 @@ use log::warn;
 use tokio::{
     sync::{
         mpsc::{self, Sender, UnboundedSender},
-        oneshot,
+        oneshot, OwnedSemaphorePermit, Semaphore,
     },
     time::Instant,
 };
@@ -65,6 +65,10 @@ pub struct SchedulerConfig {
     pub traffic_burst: u32,
     /// Hard cap on the number of requests being served concurrently.
     pub concurrency_limit: usize,
+    /// Bytes per second emitted by a request before it receives a normal grant.
+    pub slow_drain_bandwidth: NonZeroU64,
+    /// Hard cap on the number of requests serving in slow-drain mode.
+    pub slow_drain_concurrency: usize,
     /// Sustained rejected-requests-per-second tolerated before signalling overload.
     pub overload_rate: f64,
     /// Minimum gap between two overload notifications sent to the RPC server.
@@ -176,8 +180,8 @@ struct LimiterObservers {
 pub enum GrantResult {
     /// The request may proceed; hold the [`Permit`] for the whole response body.
     Granted(Permit),
-    /// The request was evicted from the queue (capacity exceeded). The handler
-    /// should behave as if its serve timeout elapsed.
+    /// The request was evicted from the normal-grant queue (capacity exceeded).
+    /// It may continue with a slow-drain grant but can no longer upgrade.
     Evicted,
 }
 
@@ -209,6 +213,7 @@ type Key = (u32, u64);
 pub struct SchedulerHandle {
     tx: UnboundedSender<SchedMsg>,
     seq: AtomicU64,
+    slow_drain: Arc<SlowDrainLimiter>,
 }
 
 impl SchedulerHandle {
@@ -218,7 +223,12 @@ impl SchedulerHandle {
     /// limiter bucket levels and the live queue size.
     pub fn spawn(config: SchedulerConfig, command: Sender<Command>, refill: Arc<RefillLimiter>, metrics: &mut Metrics) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let handle = Arc::new(Self { tx: tx.clone(), seq: AtomicU64::new(0) });
+        let slow_drain = SlowDrainLimiter::new(config.slow_drain_bandwidth, config.slow_drain_concurrency);
+        let handle = Arc::new(Self {
+            tx: tx.clone(),
+            seq: AtomicU64::new(0),
+            slow_drain: slow_drain.clone(),
+        });
         let limiters = RateLimiters::new(&config);
         let overload = OverloadTracker::new(config.overload_rate, config.overload_notify_interval, command);
         let queue_size = Arc::new(AtomicU64::new(0));
@@ -227,6 +237,7 @@ impl SchedulerHandle {
             overload: overload.gcra.observer(),
             queue_size: queue_size.clone(),
             refill,
+            slow_drain,
         });
         tokio::spawn(run(rx, tx, config, limiters, overload, queue_size));
         handle
@@ -248,6 +259,11 @@ impl SchedulerHandle {
             },
             grant_rx,
         )
+    }
+
+    /// Limiter used to begin a paced response while the normal grant is pending.
+    pub fn slow_drain(&self) -> Arc<SlowDrainLimiter> {
+        self.slow_drain.clone()
     }
 }
 
@@ -277,6 +293,61 @@ pub struct Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         let _ = self.tx.send(SchedMsg::End { info: self.info });
+    }
+}
+
+// --- Slow-drain limiter --------------------------------------------------------
+
+/// Concurrency and pacing configuration for responses waiting on a normal grant.
+pub struct SlowDrainLimiter {
+    bandwidth: NonZeroU64,
+    sem: Arc<Semaphore>,
+}
+
+impl SlowDrainLimiter {
+    fn new(bandwidth: NonZeroU64, concurrency: usize) -> Arc<Self> {
+        Arc::new(Self {
+            bandwidth,
+            sem: Arc::new(Semaphore::new(concurrency)),
+        })
+    }
+
+    /// Wait for slow-drain capacity. The returned guard releases the slot on drop.
+    pub async fn acquire(self: &Arc<Self>) -> SlowDrainPermit {
+        let permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("slow-drain semaphore is never closed");
+        SlowDrainPermit {
+            bandwidth: self.bandwidth,
+            _permit: permit,
+        }
+    }
+
+    fn available(&self) -> u64 {
+        self.sem.available_permits() as u64
+    }
+}
+
+/// Proof that a response may occupy one slow-drain slot.
+pub struct SlowDrainPermit {
+    bandwidth: NonZeroU64,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl SlowDrainPermit {
+    /// Delay needed to emit `bytes` without exceeding the configured bandwidth.
+    pub fn delay_for(&self, bytes: usize) -> Duration {
+        Duration::from_secs_f64(bytes as f64 / self.bandwidth.get() as f64)
+    }
+
+    /// Bound the interval between generated chunks below the QUIC idle timeout.
+    pub fn chunk_len(&self, remaining: usize) -> usize {
+        const MAX_PACING_INTERVAL_SECS: u64 = 5;
+        let max_len = self.bandwidth.get().saturating_mul(MAX_PACING_INTERVAL_SECS);
+        remaining.min(max_len.min(usize::MAX as u64) as usize).max(1)
     }
 }
 
@@ -457,6 +528,7 @@ pub struct SchedulerCollector {
     overload: GcraObserver,
     queue_size: Arc<AtomicU64>,
     refill: Arc<RefillLimiter>,
+    slow_drain: Arc<SlowDrainLimiter>,
 }
 
 impl std::fmt::Debug for SchedulerCollector {
@@ -477,6 +549,7 @@ impl prometheus_client::collector::Collector for SchedulerCollector {
             ("overload_remaining", "Remaining rejections in the overload bucket", self.overload.remaining(now)),
             ("queue_size", "Number of requests waiting in the serve queue", self.queue_size.load(Ordering::Relaxed)),
             ("refill_available", "Remaining concurrent cache-miss refill slots", self.refill.available()),
+            ("slow_drain_available", "Remaining concurrent slow-drain slots", self.slow_drain.available()),
         ] {
             let gauge = ConstGauge::new(value as i64);
             let metric_encoder = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;

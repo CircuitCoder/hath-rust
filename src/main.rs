@@ -1,7 +1,16 @@
 #![windows_subsystem = "windows"]
 #[cfg(not(target_env = "msvc"))]
 use std::ffi::{CStr, c_char};
-use std::{collections::HashMap, error::Error, net::{IpAddr, Ipv4Addr}, ops::RangeInclusive, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    net::{IpAddr, Ipv4Addr},
+    num::NonZeroU64,
+    ops::RangeInclusive,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use clap::Parser;
 use const_format::formatcp;
@@ -109,9 +118,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     flush_log: bool,
 
-    /// Seconds a request may wait in the serve queue before its connection is reset.
+    /// Seconds allowed for response preparation and initial serve admission.
     #[arg(long, default_value_t = 30)]
     serve_timeout: u64,
+
+    /// Optional maximum duration in seconds for an entire request, including body transmission.
+    #[arg(long)]
+    absolute_timeout: Option<NonZeroU64>,
 
     /// Maximum number of requests allowed to wait in the serve queue; the largest
     /// queued request is evicted when exceeded.
@@ -141,6 +154,14 @@ struct Args {
     /// Hard cap on the number of requests served concurrently.
     #[arg(long, default_value_t = 200)]
     concurrency_limit: usize,
+
+    /// Bandwidth in bytes/second used while a request waits for a normal grant.
+    #[arg(long, default_value_t = NonZeroU64::new(10_000).unwrap())]
+    slow_drain_bandwidth: NonZeroU64,
+
+    /// Maximum number of requests that may transmit in slow-drain mode.
+    #[arg(long, default_value_t = 500)]
+    slow_drain_concurrency: usize,
 
     /// Sustained rejected requests/second tolerated before reporting overload.
     #[arg(long, default_value_t = 100.0)]
@@ -291,6 +312,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             traffic_rate: args.traffic_rate,
             traffic_burst: args.traffic_burst,
             concurrency_limit: args.concurrency_limit,
+            slow_drain_bandwidth: args.slow_drain_bandwidth,
+            slow_drain_concurrency: args.slow_drain_concurrency,
             overload_rate: args.overload_rate,
             overload_notify_interval: Duration::from_secs(args.overload_notify_interval),
         },
@@ -346,6 +369,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .metrics(args.enable_metrics)
             .sni_strict(args.sni_strict)
             .server_header(!args.disable_server_header)
+            .absolute_timeout(args.absolute_timeout.map(|timeout| Duration::from_secs(timeout.get())))
             .h3(args.enable_h3),
     );
     let server_handle = server.handle();

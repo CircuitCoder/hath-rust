@@ -36,7 +36,7 @@ use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
-    ratelimit::{GrantResult, ReqInfo, SchedulerHandle},
+    ratelimit::{GrantResult, Permit, ReqInfo, SchedulerHandle, SlowDrainPermit},
     route::{forbidden, not_found, parse_additional},
     server::util::{ResetConnection, TruncateBody},
     util::{create_http_client, string_to_hash},
@@ -45,6 +45,24 @@ use crate::{
 const TTL: RangeInclusive<i64> = -900..=900; // Token TTL 15 minutes
 const CACHE_HEADER: HeaderValue = HeaderValue::from_static("public, max-age=31536000, immutable");
 const DEFAULT_CD: HeaderValue = HeaderValue::from_static("inline");
+
+enum TransferPermit {
+    Normal { _permit: Permit },
+    SlowDrain(SlowDrainPermit),
+}
+
+impl TransferPermit {
+    fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal { .. })
+    }
+
+    fn slow_drain(&self) -> Option<&SlowDrainPermit> {
+        match self {
+            Self::Normal { .. } => None,
+            Self::SlowDrain(permit) => Some(permit),
+        }
+    }
+}
 
 pub(super) async fn hath(
     Path((file_id, additional, file_name)): Path<(String, String, String)>,
@@ -126,8 +144,7 @@ pub(super) async fn hath(
     // The head-producing phase below is bounded by the serve timeout (a cache miss
     // does network work here); exceeding it resets the connection *before* any head
     // is sent. Once the head is built, the in-body wait is bounded by the remaining
-    // serve timeout, and a timeout/eviction there resets the (already-headed)
-    // stream instead — no status code is ever emitted for a timed-out request.
+    // serve timeout only until either a normal or slow-drain grant arrives.
     //
     // Clone shared handles here because `data` is moved into the download worker on
     // a cache miss, so it is not available after that point.
@@ -420,14 +437,12 @@ pub(super) async fn hath(
 /// HEAD requests carry no body and are not scheduled: they return immediately with
 /// an empty body, bypassing the rate limiters.
 ///
-/// For every other method the returned body first enqueues the request into the
-/// scheduler and awaits its grant *inside the stream*, so the response head has
-/// already been delivered by the time this runs. Holding the [`Ticket`] across the
-/// grant await means a client disconnect (body dropped) still removes the request
-/// from the queue. Once granted, the [`Permit`] is held for the whole body and the
-/// inner data stream is forwarded. If the request times out, is evicted, or the
-/// scheduler is gone, the body errors so the connection/stream is reset instead of
-/// finishing normally — no status code is emitted, matching the timeout semantics.
+/// For every other method the returned body simultaneously requests a normal
+/// scheduler grant and a slow-drain concurrency grant. The serve timeout applies
+/// only until either grant arrives. A slow-draining response remains queued for a
+/// normal grant and upgrades immediately when one arrives, releasing its
+/// slow-drain slot. All queue tickets and permits live in the stream so dropping
+/// the response releases every resource it still owns.
 fn build_body<S>(
     schedule: bool,
     scheduler: Arc<SchedulerHandle>,
@@ -445,27 +460,93 @@ where
     }
     Body::from_stream(stream! {
         let (_ticket, grant) = scheduler.enqueue(info);
-        let remaining = serve_timeout.saturating_sub(recv_time.elapsed());
-        let _permit = match timeout(remaining, grant).await {
-            Ok(Ok(GrantResult::Granted(permit))) => permit,
-            Err(_) => {
-                // Timed out waiting for scheduler capacity. The head is already on
-                // the wire, so error the body to reset the connection/stream.
-                timeout_metric.inc();
-                yield Err::<Bytes, _>(reset_error());
-                return;
+        let slow_drain = scheduler.slow_drain();
+        let mut normal_grant = Box::pin(async move {
+            match grant.await {
+                Ok(GrantResult::Granted(permit)) => Some(permit),
+                Ok(GrantResult::Evicted) | Err(_) => None,
             }
-            // Evicted from the queue (capacity) or the scheduler is gone: reset.
-            Ok(Ok(GrantResult::Evicted)) | Ok(Err(_)) => {
-                yield Err::<Bytes, _>(reset_error());
-                return;
+        });
+        let mut normal_pending = true;
+
+        let mut transfer_permit = {
+            let mut slow_grant = Box::pin(slow_drain.acquire());
+            let remaining = serve_timeout.saturating_sub(recv_time.elapsed());
+            let mut deadline = Box::pin(sleep(remaining));
+
+            loop {
+                tokio::select! {
+                    biased;
+                    permit = &mut normal_grant, if normal_pending => {
+                        normal_pending = false;
+                        if let Some(permit) = permit {
+                            break TransferPermit::Normal { _permit: permit };
+                        }
+                    }
+                    permit = &mut slow_grant => break TransferPermit::SlowDrain(permit),
+                    _ = &mut deadline => {
+                        // No admission grant arrived before the serve timeout. The
+                        // response head is already on the wire, so reset the stream.
+                        timeout_metric.inc();
+                        yield Err::<Bytes, _>(reset_error());
+                        return;
+                    }
+                }
             }
         };
-        // `_permit` is held for the whole body; dropping it releases the serve.
+
         let mut inner = std::pin::pin!(inner);
-        while let Some(item) = inner.next().await {
+        loop {
+            // Poll the normal grant while waiting for disk/download data so an
+            // upgrade promptly returns the slow-drain slot.
+            let item = loop {
+                if transfer_permit.is_normal() || !normal_pending {
+                    break inner.next().await;
+                }
+                tokio::select! {
+                    biased;
+                    permit = &mut normal_grant => {
+                        normal_pending = false;
+                        if let Some(permit) = permit {
+                            transfer_permit = TransferPermit::Normal { _permit: permit };
+                        }
+                    }
+                    item = inner.next() => break item,
+                }
+            };
+
+            let Some(item) = item else {
+                return;
+            };
             match item {
-                Ok(bytes) => yield Ok(bytes),
+                Ok(mut bytes) => while !bytes.is_empty() {
+                    let Some(slow) = transfer_permit.slow_drain() else {
+                        yield Ok(bytes);
+                        break;
+                    };
+                    let chunk_len = slow.chunk_len(bytes.len());
+                    let delay = slow.delay_for(chunk_len);
+                    let chunk = bytes.split_to(chunk_len);
+
+                    if normal_pending {
+                        let mut pacing = Box::pin(sleep(delay));
+                        tokio::select! {
+                            biased;
+                            permit = &mut normal_grant => {
+                                normal_pending = false;
+                                if let Some(permit) = permit {
+                                    transfer_permit = TransferPermit::Normal { _permit: permit };
+                                } else {
+                                    pacing.await;
+                                }
+                            }
+                            _ = &mut pacing => {}
+                        }
+                    } else {
+                        sleep(delay).await;
+                    }
+                    yield Ok(chunk);
+                },
                 Err(err) => {
                     yield Err(err);
                     return;
